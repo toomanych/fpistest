@@ -60,6 +60,8 @@ class HIOCDialog:
         self.fidsize_values = {}
         self.selected_threshold = None
         self.selected_file_path = None
+        self.parsed_fidsize = None        # Parsed FIDSize from parameter file
+        self.parsed_parameters = None     # Parsed parameter list from file
         
         # Operators and validator
         self.current_operator = None
@@ -439,8 +441,10 @@ class HIOCDialog:
     def on_operation_change(self):
         """Handle operation type change"""
         if self.operation_var.get() == "parameter_set":
-            self.file_frame.pack(fill="x", padx=10, pady=5, after=self.file_frame.master.winfo_children()[2])
+            # Show the file frame - pack it after the operation type frame
+            self.file_frame.pack(fill="x", padx=10, pady=5)
         else:
+            # Hide the file frame
             self.file_frame.pack_forget()
 
     def browse_parameter_file(self):
@@ -454,11 +458,14 @@ class HIOCDialog:
             self.file_path_var.set(file_path)
             self.selected_file_path = file_path
             
-            # Validate file
+            # Validate file and store parsed data
             try:
-                self.validate_parameter_file(file_path)
+                fidsize, parameters = self.validate_parameter_file(file_path)
+                self.parsed_fidsize = fidsize
+                self.parsed_parameters = parameters
+                
                 self.file_status_label.config(
-                    text="✓ Valid parameter file", 
+                    text="✓ Valid: FIDSize={}, {} parameters".format(fidsize, len(parameters)), 
                     foreground="green"
                 )
             except Exception as e:
@@ -467,9 +474,11 @@ class HIOCDialog:
                     foreground="red"
                 )
                 self.selected_file_path = None
+                self.parsed_fidsize = None
+                self.parsed_parameters = None
 
-    def validate_parameter_file(self, file_path: str):
-        """Validate parameter CSV file"""
+    def validate_parameter_file(self, file_path: str) -> Tuple[int, List[int]]:
+        """Validate parameter CSV file and return FIDSize and parameter list"""
         with open(file_path, 'r') as file:
             content = file.read().strip().replace('\r', '')
             
@@ -479,20 +488,31 @@ class HIOCDialog:
         if len(hex_values) < 1:
             raise ValueError("File must contain at least FIDSize")
         
-        # Validate hex format
+        # Validate hex format and convert to integers
+        int_values = []
         for i, hex_val in enumerate(hex_values):
             try:
-                int(hex_val, 16)
+                int_value = int(hex_val, 16)
+                if int_value > 0xFFFFFFFF:
+                    raise ValueError("Parameter {} exceeds uint32 range: {}".format(i+1, hex_val))
+                int_values.append(int_value)
             except ValueError:
                 raise ValueError("Invalid hex value at position {}: {}".format(i+1, hex_val))
         
-        # Check parameter count
-        fidsize = int(hex_values[0], 16)
-        param_count = len(hex_values) - 1
+        # Extract FIDSize and parameters
+        fidsize = int_values[0]
+        parameters = int_values[1:]
         
-        if param_count != fidsize - 1:
+        # Check parameter count
+        if len(parameters) != fidsize - 1:
             raise ValueError("FIDSize {} expects {} parameters, found {}".format(
-                fidsize, fidsize-1, param_count))
+                fidsize, fidsize-1, len(parameters)))
+        
+        # Validate parameter count limits
+        if len(parameters) > 511:
+            raise ValueError("Too many parameters: {} (max 511)".format(len(parameters)))
+        
+        return fidsize, parameters
 
     def log_message(self, message: str):
         """Add message to log"""
@@ -972,13 +992,20 @@ class HIOCDialog:
             self.operation_in_progress = False
             return
         
-        # Create SUPOperator configuration with connected client
+        # Validate parsed parameter data is available
+        if self.parsed_fidsize is None or self.parsed_parameters is None:
+            self.update_progress("Parameter file not properly parsed")
+            self.operation_in_progress = False
+            return
+        
+        # Create SUPOperator configuration with parsed data
         config = SUPOperationConfig(
             client=server_info.client,  # Use existing connection
             controller_id=server_info.controller_id,
             fid=fid,
             operation_type=HIOCOperationType.STRUCTURED_PARAMS,
-            csv_file_path=self.selected_file_path,
+            fidsize=self.parsed_fidsize,
+            parameters=self.parsed_parameters,
             progress_callback=self.update_progress
         )
         
@@ -1126,7 +1153,7 @@ class HIOCDialog:
             self.log_message("--- {} SUP ABORT ANALYSIS ---".format(server))
             self.log_message(abort_analysis)
         
-        hioc_operation = operation_mapping.get(operation)
+        hioc_operation=operation_mapping.get(operation)
         if not hioc_operation:
             self.dialog.after(0, self.update_progress, "{}: Invalid HIOC operation: {}".format(
                 server, operation))
