@@ -2,6 +2,8 @@
 HIOC Protocol Operator Class
 Handles HIOC_BO and HIOC_TH operations for a single FID on one server
 with comprehensive progress reporting and abort tracing.
+Fixed sequence management to properly read last response and handle overflow.
+All progress reporting through _log_step and _report_progress methods.
 """
 
 import time
@@ -33,6 +35,7 @@ class HIOCStep(Enum):
     STEP3_RESPONSE = "step3_response"
     COMPLETED = "completed"
     ABORTED = "aborted"
+    CONNECTING = "connecting"  # Added for compatibility
 
 
 class HIOCStepResult:
@@ -53,13 +56,15 @@ class HIOCStepResult:
 class HIOCOperationConfig:
     """Configuration for HIOC operation"""
     def __init__(self, client: Client, controller_id: int, fid: str, 
-                 operation_type: HIOCOperationType, threshold_value: Optional[int] = None,
-                 timeout_seconds: float = 10.0, progress_callback: Optional[Callable[[str], None]] = None):
+                 operation_type: HIOCOperationType, threshold_command_code: Optional[int] = None,
+                 threshold_value: Optional[int] = None, timeout_seconds: float = 10.0, 
+                 progress_callback: Optional[Callable[[str], None]] = None):
         self.client = client
         self.controller_id = controller_id
         self.fid = fid  # F0-F5
         self.operation_type = operation_type
-        self.threshold_value = threshold_value  # TH1-TH15 (1-15) for HIOC_TH operations
+        self.threshold_command_code = threshold_command_code  # CC (1-15) for threshold operations
+        self.threshold_value = threshold_value  # Actual threshold value from HTT for threshold operations
         self.timeout_seconds = timeout_seconds
         self.progress_callback = progress_callback
 
@@ -122,8 +127,11 @@ class HIOCOperator:
             raise ValueError("Connected client is required")
             
         if self.config.operation_type == HIOCOperationType.THRESHOLD:
-            if not self.config.threshold_value or not (1 <= self.config.threshold_value <= 15):
-                raise ValueError("Threshold operations require threshold_value between 1-15")
+            if (not self.config.threshold_command_code or 
+                not (1 <= self.config.threshold_command_code <= 15)):
+                raise ValueError("Threshold operations require threshold_command_code between 1-15")
+            if self.config.threshold_value is None:
+                raise ValueError("Threshold operations require threshold_value")
         
         # Generate valid FID list F0-F31 for generic support
         valid_fids = ['F{}'.format(i) for i in range(32)]
@@ -158,17 +166,59 @@ class HIOCOperator:
             else:
                 self._report_progress("✗ {}: {}".format(step.value, error_message or 'Failed'))
 
+    def _read_last_response_sequence(self) -> Optional[int]:
+        """Read the current response sequence from the server to ensure proper sequence management"""
+        try:
+            objects = self.client.get_objects_node()
+            seq_node = objects.get_child(["1:HIOCOut", "1:{}".format(self.config.fid), "1:FTS", "1:SEQ"])
+            last_seq = seq_node.get_value()
+            return last_seq
+        except Exception as e:
+            # If we can't read the sequence, fall back to internal tracking
+            return self.last_response_sequence
+
     def _get_next_sequence(self) -> int:
-        """Get next challenge sequence number (always odd)"""
-        if self.last_response_sequence == 0:
-            return 1
-        next_seq = self.last_response_sequence + 1
-        return 1 if next_seq > 253 else next_seq
+        """
+        Get next challenge sequence number (always odd).
+        Properly reads last response sequence and handles overflow correctly.
+        Challenge sequences: 1, 3, 5, ..., 251, 253, then back to 1
+        Response sequences: 0, 2, 4, ..., 252, 254, then back to 0
+        """
+        # First try to read the actual last response sequence from server
+        server_last_seq = self._read_last_response_sequence()
+        
+        # Use server sequence if available, otherwise fall back to internal tracking
+        if server_last_seq is not None:
+            last_response = server_last_seq
+        else:
+            last_response = self.last_response_sequence
+        
+        # Calculate next challenge sequence
+        if last_response == 0:
+            # First operation or after response sequence 254→0 overflow
+            next_challenge = 1
+        elif last_response == 254:
+            # Response sequence overflow: 254 → next challenge is 1
+            next_challenge = 1
+        else:
+            # Normal case: last_response + 1
+            next_challenge = last_response + 1
+            # Handle challenge sequence overflow: 253 → 1
+            if next_challenge > 253:
+                next_challenge = 1
+        
+        # Ensure challenge sequences are always odd
+        if next_challenge % 2 == 0:
+            next_challenge += 1
+            if next_challenge > 253:
+                next_challenge = 1
+        
+        return next_challenge
 
     def _update_sequence(self, response_seq: int):
         """Update sequence tracking based on response"""
-        self.current_sequence = self._get_next_sequence()
         self.last_response_sequence = response_seq
+        self.current_sequence = self._get_next_sequence()
 
     def _write_challenge_data(self, ctr: int, flg: int, msg: int, value: int, seq: int):
         """Write challenge data to HIOCIn nodes with guaranteed SEQ field written last"""
@@ -194,9 +244,15 @@ class HIOCOperator:
             time.sleep(0.001)  # Small delay to ensure write ordering
             seq_node.set_value(ua.Variant(int(seq), ua.VariantType.Int32))
             
-            return {
+            challenge_data = {
                 'CTR': ctr, 'FLG': flg, 'MSG': msg, 'VALUE': value, 'SEQ': seq
             }
+            
+            # Log the challenge that was sent
+            self._report_progress("Challenge sent: CTR={}, FLG={}, MSG={}, VALUE={}, SEQ={}".format(
+                ctr, flg, msg, value, seq))
+            
+            return challenge_data
             
         except Exception as e:
             raise Exception("Failed to write challenge data: {}".format(e))
@@ -225,12 +281,17 @@ class HIOCOperator:
         except Exception as e:
             raise Exception("Failed to read response data: {}".format(e))
 
-    def _wait_for_response(self, expected_flag: int, timeout: float = None) -> Tuple[bool, Dict[str, Any]]:
-        """Wait for expected response flag with timeout"""
+    def _wait_for_response(self, expected_flag: int, challenge_data: Dict[str, Any], timeout: float = None) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Wait for response with correct SEQ, then validate according to HIOC specification.
+        Returns success/failure based on proper response validation.
+        """
         if timeout is None:
             timeout = self.config.timeout_seconds
             
         start_time = time.time()
+        challenge_seq = challenge_data['SEQ']
+        expected_response_seq = challenge_seq + 1 if challenge_seq < 254 else 0  # SEQ overflow handling
         
         while time.time() - start_time < timeout:
             if self.abort_requested:
@@ -238,16 +299,62 @@ class HIOCOperator:
                 
             try:
                 response = self._read_response_data()
-                if response['FLG'] == expected_flag:
-                    return True, response
-                elif response['FLG'] == 9:  # Abort flag
-                    return False, response
+                
+                # Wait for the response to OUR challenge (correct SEQ)
+                if response['SEQ'] == expected_response_seq:
+                    # Found our response - now validate it
                     
-            except Exception:
+                    # Log the actual response received
+                    self._report_progress("Response received: SEQ={}, FLG={}, CTR={}, MSG={}, VALUE={}".format(
+                        response['SEQ'], response['FLG'], response['CTR'], response['MSG'], response['VALUE']))
+                    
+                    # Check for abort responses (FLG in [7,8,9,10])
+                    if response['FLG'] in [7, 8, 9, 10]:
+                        self._report_progress("Server aborted operation with FLG={}".format(response['FLG']))
+                        return False, response
+                    
+                    # Check if we got the expected response flag
+                    if response['FLG'] != expected_flag:
+                        self._report_progress("Unexpected response flag: expected {}, got {}".format(
+                            expected_flag, response['FLG']))
+                        return False, response
+                    
+                    # Validate Controller ID - response should have correct CTR for this system
+                    if response['CTR'] != challenge_data['CTR']:
+                        self._report_progress("Controller ID mismatch: challenge used {}, response from {}".format(
+                            challenge_data['CTR'], response['CTR']))
+                        return False, response
+                    
+                    # Validate Message ID - should echo challenge MSG unless abort/success
+                    if response['MSG'] != challenge_data['MSG']:
+                        # Check if this is an abort or success message
+                        if response['MSG'] in [9000000, 9100000, 9300000, 7500000]:
+                            self._report_progress("Operation result: MSG={}".format(response['MSG']))
+                        else:
+                            self._report_progress("Message ID mismatch: expected {}, got {}".format(
+                                challenge_data['MSG'], response['MSG']))
+                            return False, response
+                    
+                    # Validate VALUE for Step 2 threshold operations
+                    if (self.config.operation_type == HIOCOperationType.THRESHOLD and 
+                        expected_flag == 4 and  # Step 2 response flag
+                        response['VALUE'] != challenge_data['VALUE']):
+                        self._report_progress("Value mismatch in step 2: expected {}, got {}".format(
+                            challenge_data['VALUE'], response['VALUE']))
+                        return False, response
+                    
+                    # All validations passed
+                    self._report_progress("Valid response: all validations passed")
+                    return True, response
+                    
+            except Exception as e:
+                self._log_step(HIOCStep.CONNECTING, False, error_message="Error reading response: {}".format(e))
                 pass
                 
             time.sleep(0.1)  # 100ms polling
-            
+        
+        # Timeout occurred
+        self._report_progress("Timeout waiting for response to challenge SEQ={}".format(challenge_seq))
         return False, {}  # Timeout
 
     def _perform_htt_request(self) -> bool:
@@ -267,8 +374,8 @@ class HIOCOperator:
             
             self._log_step(HIOCStep.HTT_REQUEST, True, challenge_data=challenge_data)
             
-            # Wait for HTT response (flag 22)
-            success, response_data = self._wait_for_response(22)
+            # Wait for HTT response (flag 22) with proper validation
+            success, response_data = self._wait_for_response(22, challenge_data)
             
             if success:
                 self._update_sequence(response_data['SEQ'])
@@ -303,27 +410,33 @@ class HIOCOperator:
                 # Function validation
                 msg_id = 2460000 + fid_num  # FunctionID format
                 flag = self.flag_values['function_validation'][self.config.operation_type]
-                value = 0
+                # For threshold operations, VALUE should contain the selected threshold value
+                if self.config.operation_type == HIOCOperationType.THRESHOLD:
+                    value = self.config.threshold_value  # Actual threshold value from HTT
+                else:
+                    value = 0
             elif step_num == 2:
                 # Command step
                 if self.config.operation_type == HIOCOperationType.THRESHOLD:
-                    command_code = self.config.threshold_value
+                    command_code = self.config.threshold_command_code  # CC (1-15) selected by user
+                    value = self.config.threshold_value  # Actual threshold value from HTT
                 else:
                     command_code = self.command_codes[self.config.operation_type]
+                    value = 0
                     
-                msg_id = 3460000 + command_code  # CommandID format
+                msg_id = 3460000 + command_code  # CommandID format: 3460000 + CC
                 flag = self.flag_values['command'][self.config.operation_type]
-                value = 0
             else:  # step_num == 3
                 # Confirmation step
                 if self.config.operation_type == HIOCOperationType.THRESHOLD:
-                    command_code = self.config.threshold_value
+                    command_code = self.config.threshold_command_code  # CC (1-15) selected by user
+                    value = self.config.threshold_value  # Actual threshold value from HTT
                 else:
                     command_code = self.command_codes[self.config.operation_type]
+                    value = 0
                     
-                msg_id = 400000 + fid_num * 100 + command_code  # ConfirmationID format
+                msg_id = 4000000 + fid_num * 100 + command_code  # ConfirmationID format: 4000000 + FID*100 + CC
                 flag = self.flag_values['confirmation'][self.config.operation_type]
-                value = 0
             
             seq = self._get_next_sequence()
             challenge_data = self._write_challenge_data(
@@ -336,8 +449,8 @@ class HIOCOperator:
             
             self._log_step(challenge_step, True, challenge_data=challenge_data)
             
-            # Wait for response
-            success, response_data = self._wait_for_response(expected_response_flag)
+            # Wait for response with proper validation
+            success, response_data = self._wait_for_response(expected_response_flag, challenge_data)
             
             if success:
                 self._update_sequence(response_data['SEQ'])
@@ -384,7 +497,11 @@ class HIOCOperator:
                     return False
             
             # Step 1: Function validation
-            if not self._perform_hioc_step(1, 2):  # Expect flag 2 response
+            expected_flag_1 = 12 if self.config.operation_type in [
+                HIOCOperationType.OVERRIDE_UNSET, HIOCOperationType.ENABLE
+            ] else 2
+            
+            if not self._perform_hioc_step(1, expected_flag_1):
                 return False
             
             if self.abort_requested:
@@ -392,11 +509,11 @@ class HIOCOperator:
                 return False
             
             # Step 2: Command
-            expected_flag = 4 if self.config.operation_type in [
-                HIOCOperationType.THRESHOLD, HIOCOperationType.OVERRIDE_SET, HIOCOperationType.DISABLE
-            ] else 14
+            expected_flag_2 = 14 if self.config.operation_type in [
+                HIOCOperationType.OVERRIDE_UNSET, HIOCOperationType.ENABLE
+            ] else 4
             
-            if not self._perform_hioc_step(2, expected_flag):
+            if not self._perform_hioc_step(2, expected_flag_2):
                 return False
             
             if self.abort_requested:
@@ -404,9 +521,11 @@ class HIOCOperator:
                 return False
             
             # Step 3: Confirmation
-            expected_flag = 6  # Success flag for all operations
+            expected_flag_3 = 16 if self.config.operation_type in [
+                HIOCOperationType.OVERRIDE_UNSET, HIOCOperationType.ENABLE
+            ] else 6
             
-            if not self._perform_hioc_step(3, expected_flag):
+            if not self._perform_hioc_step(3, expected_flag_3):
                 return False
             
             # Operation completed successfully
