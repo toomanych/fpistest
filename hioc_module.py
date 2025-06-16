@@ -240,32 +240,99 @@ class HIOCDialog:
                         args=(servers_to_check, fid), daemon=True).start()
 
     def check_fidsize_async(self, servers_to_check: List[str], fid: str):
-        """Check FIDSize asynchronously"""
+        """Check FIDSize asynchronously (requires HTT population via Flag=21→22 first)"""
         try:
             fidsize_support = {}
             
             for server_name in servers_to_check:
                 if server_name in self.servers and self.servers[server_name].connected:
                     client = self.servers[server_name].client
-                    fidsize = self.read_fidsize(client, fid)
-                    fidsize_support[server_name] = fidsize
+                    
+                    # First perform HTT request to populate HTT registry
+                    htt_populated = self.populate_htt_for_fidsize_check(client, fid, server_name)
+                    
+                    if htt_populated:
+                        fidsize = self.read_fidsize(client, fid)
+                        fidsize_support[server_name] = fidsize
+                    else:
+                        logger.warning("Failed to populate HTT for {} on {}".format(fid, server_name))
+                        fidsize_support[server_name] = None
                     
             # Update UI in main thread
             self.dialog.after(0, self.update_fidsize_availability, fidsize_support, fid)
             
         except Exception as e:
-            logger.error(f"Error checking FIDSize: {e}")
+            logger.error("Error checking FIDSize: {}".format(e))
             self.dialog.after(0, self.disable_parameter_set, "Check failed: {}".format(e))
 
+    def populate_htt_for_fidsize_check(self, client, fid: str, server_name: str) -> bool:
+        """Perform Flag=21→22 sequence to populate HTT before reading FIDSize"""
+        try:
+            # This is similar to the HTT request in HIOCOperator but simplified for FIDSize check
+            objects = client.get_objects_node()
+            
+            # Get controller ID for this server
+            server_info = self.servers[server_name]
+            controller_id = server_info.controller_id
+            
+            if controller_id is None:
+                logger.warning("No controller ID for {}".format(server_name))
+                return False
+            
+            # Extract FID number
+            fid_num = int(fid[1:])  # F0→0, F1→1, etc.
+            function_id = 2460000 + fid_num
+            
+            # Write HTT request challenge (Flag=21) using browse paths
+            ctr_node = objects.get_child(["1:HIOCIn", "1:{}".format(fid), "1:STF", "1:CTR"])
+            flg_node = objects.get_child(["1:HIOCIn", "1:{}".format(fid), "1:STF", "1:FLG"])
+            msg_node = objects.get_child(["1:HIOCIn", "1:{}".format(fid), "1:STF", "1:MSG"])
+            value_node = objects.get_child(["1:HIOCIn", "1:{}".format(fid), "1:STF", "1:VALUE"])
+            seq_node = objects.get_child(["1:HIOCIn", "1:{}".format(fid), "1:STF", "1:SEQ"])
+            
+            # Write challenge data
+            from opcua import ua
+            ctr_node.set_value(ua.Variant(controller_id, ua.VariantType.UInt32))
+            flg_node.set_value(ua.Variant(21, ua.VariantType.UInt32))  # HTT request flag
+            msg_node.set_value(ua.Variant(function_id, ua.VariantType.UInt32))
+            value_node.set_value(ua.Variant(0, ua.VariantType.UInt32))
+            seq_node.set_value(ua.Variant(1, ua.VariantType.Int32))  # Simple sequence for check
+            
+            # Wait for HTT response (Flag=22)
+            import time
+            timeout = 5.0  # Shorter timeout for FIDSize check
+            start_time = time.time()
+            
+            flg_response_node = objects.get_child(["1:HIOCOut", "1:{}".format(fid), "1:FTS", "1:FLG"])
+            
+            while time.time() - start_time < timeout:
+                response_flag = flg_response_node.get_value()
+                if response_flag == 22:  # HTT response flag
+                    logger.info("HTT populated for {} on {}".format(fid, server_name))
+                    return True
+                elif response_flag == 9:  # Abort
+                    logger.warning("HTT request aborted for {} on {}".format(fid, server_name))
+                    return False
+                time.sleep(0.1)
+            
+            logger.warning("HTT request timeout for {} on {}".format(fid, server_name))
+            return False
+            
+        except Exception as e:
+            logger.error("Failed to populate HTT for {} on {}: {}".format(fid, server_name, e))
+            return False
+
     def read_fidsize(self, client: Client, fid: str) -> Optional[int]:
-        """Read FIDSize for a given FID"""
+        """Read FIDSize for a given FID from common HTT registry"""
         try:
             objects = client.get_objects_node()
-            fidsize_node = objects.get_child(["1:HTT", f"1:FIDSize{fid}"])
+            # HTT is common registry, but FIDSize might be FID-specific within it
+            # Check if this should be a common FIDSize or FID-specific based on spec
+            fidsize_node = objects.get_child(["1:HTT", "1:FIDSize"])  # Common FIDSize, not FID-specific
             fidsize = fidsize_node.get_value()
             return fidsize
         except Exception as e:
-            logger.error("Failed to read FIDSize{}: {}".format(fid, e))
+            logger.error("Failed to read FIDSize for {}: {}".format(fid, e))
             return None
 
     def update_fidsize_availability(self, fidsize_support: Dict[str, Optional[int]], fid: str):

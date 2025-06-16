@@ -106,12 +106,13 @@ class SUPOperator(HIOCOperator):
         self._log_step(hioc_step, success, challenge_data, response_data, error_message, timeout)
 
     def _check_sup_capability(self) -> bool:
-        """Check if FID supports SUP by reading HTT FIDSize"""
+        """Check if FID supports SUP by reading HTT FIDSize (HTT populated after Flag=21→22)"""
         try:
             self._report_progress("Checking SUP capability for {}...".format(self.config.fid))
             
-            # Read FIDSize from HTT
-            fid_size_path = ['HTT', 'FIDSize{}'.format(self.config.fid)]
+            # Read FIDSize from common HTT registry (populated after Flag=21→22 sequence)
+            # Note: HTT must be populated first via Flag=21 challenge before reading FIDSize
+            fid_size_path = ['HTT', 'FIDSize']  # Common HTT registry, not FID-specific
             fid_size_node = self.client.get_node("ns=2;s=" + ".".join(fid_size_path))
             fid_size = fid_size_node.get_value()
             

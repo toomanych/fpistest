@@ -101,15 +101,16 @@ class HIOCSUPValidator:
             return None
 
     def read_fidsize(self, client: Client, fid: str) -> Optional[int]:
-        """Read FIDSize for a given FID"""
+        """Read FIDSize for a given FID from common HTT registry (HTT must be populated first)"""
         try:
             objects = client.get_objects_node()
-            fidsize_node = objects.get_child(["1:HTT", f"1:FIDSize{fid}"])
+            # HTT is common registry populated after Flag=21→22 sequence
+            fidsize_node = objects.get_child(["1:HTT", "1:FIDSize"])  # Common FIDSize
             fidsize = fidsize_node.get_value()
             return fidsize
             
         except Exception as e:
-            logger.error("Failed to read FIDSize{}: {}".format(fid, e))
+            logger.error("Failed to read FIDSize for {}: {}".format(fid, e))
             return None
 
     def compare_htt_tables(self) -> HTTComparisonResult:
