@@ -226,10 +226,10 @@ class COSOperator:
             
             # Write to CGX.COS.COS_OPREQ
             cos_opreq_node = objects.get_child(["1:CGX", "1:COS", "1:COS_OPREQ"])
-            cos_opreq_node.set_value(command.value)
+            cos_opreq_node.set_value(command.int_value)  # Use int_value instead of value
             
             logger.info("Wrote COS command to {}: {} ({})".format(
-                server_name, command.description, command.value))
+                server_name, command.description, command.int_value))
             return True
             
         except Exception as e:
@@ -290,8 +290,8 @@ class COSOperator:
                 connected=False,
                 cos_state=COSState.OFF,
                 psos_state=PSOSState.OFF,
-                cos_raw_value=COSState.OFF.value,
-                psos_raw_value=PSOSState.OFF.value
+                cos_raw_value=COSState.OFF.int_value,  # Use int_value
+                psos_raw_value=PSOSState.OFF.int_value  # Use int_value
             )
         
         try:
@@ -330,8 +330,8 @@ class COSOperator:
                 connected=False,
                 cos_state=COSState.OFF,
                 psos_state=PSOSState.OFF,
-                cos_raw_value=COSState.OFF.value,
-                psos_raw_value=PSOSState.OFF.value
+                cos_raw_value=COSState.OFF.int_value,  # Use int_value
+                psos_raw_value=PSOSState.OFF.int_value  # Use int_value
             )
 
     def read_all_system_states(self) -> Dict[str, SystemState]:

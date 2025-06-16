@@ -159,7 +159,7 @@ class MainGUI:
         for command, row, col in commands:
             btn = ttk.Button(
                 cos_frame, 
-                text="{}\n({})".format(command.description, command.value),
+                text="{}\n({})".format(command.description, command.int_value),
                 command=lambda cmd=command: self.send_cos_command_dialog(cmd),
                 width=15
             )
@@ -216,9 +216,14 @@ class MainGUI:
         
         row = 0
         
-        # COS State
-        ttk.Label(server_frame, text="COS State:", font=('TkDefaultFont', 9, 'bold')).grid(
-            row=row, column=0, sticky=tk.W, pady=2)
+        # COS State (or PSOS State for FPIS)
+        if server_name == 'FPIS':
+            ttk.Label(server_frame, text="PSOS State:", font=('TkDefaultFont', 9, 'bold')).grid(
+                row=row, column=0, sticky=tk.W, pady=2)
+        else:
+            ttk.Label(server_frame, text="COS State:", font=('TkDefaultFont', 9, 'bold')).grid(
+                row=row, column=0, sticky=tk.W, pady=2)
+        
         self.status_labels[server_name]['COS'] = ttk.Label(
             server_frame, text="N/A", relief="sunken", width=25, anchor="center")
         self.status_labels[server_name]['COS'].grid(
@@ -383,7 +388,7 @@ class MainGUI:
         
         # Send to FPIS directly
         if send_to_fpis:
-            success = self.send_fpis_cos_command(command.value)
+            success = self.send_fpis_cos_command(command.int_value)  # Use int_value
             status = "✓" if success else "✗"
             results.append("FPIS: {}".format(status))
         
@@ -401,7 +406,7 @@ class MainGUI:
             objects = client.get_objects_node()
             
             opreq_node = objects.get_child(["1:STF_In", "1:OPREQ"])
-            opreq_node.set_value(value)
+            opreq_node.set_value(value)  # value is already an int from command.int_value
             
             logger.info("Sent COS command {} to FPIS".format(value))
             return True
@@ -488,29 +493,80 @@ class MainGUI:
                 time.sleep(1)
 
     def read_fpis_status(self) -> Optional[SystemState]:
-        """Read FPIS status directly"""
+        """Read FPIS status directly (FPIS reports PSOS states, not COS states)"""
         try:
             client = self.servers['FPIS'].client
             objects = client.get_objects_node()
             
             cos_node = objects.get_child(["1:FTS_Out", "1:PSOS", "1:OPSTATE"])
-            cos_value = cos_node.get_value()
+            psos_value = cos_node.get_value()  # This is actually a PSOS state value
             
-            # Map to COSState
-            cos_state = self.cos_operator.get_cos_state_by_value(cos_value)
+            # Map PSOS state to equivalent COS state for display purposes
+            cos_state = self._map_psos_to_cos_for_display(psos_value)
             
             return SystemState(
                 server_name='FPIS',
                 connected=True,
                 cos_state=cos_state,
-                psos_state=None,  # FPIS doesn't have separate PSOS
-                cos_raw_value=cos_value,
+                psos_state=None,  # FPIS doesn't have separate PSOS display
+                cos_raw_value=psos_value,  # Show actual PSOS value
                 psos_raw_value=None
             )
             
         except Exception as e:
             logger.error("Failed to read FPIS status: {}".format(e))
             return None
+
+    def _map_psos_to_cos_for_display(self, psos_value: int):
+        """Map PSOS state values to equivalent COS states for display purposes"""
+        # PSOS to COS mapping for states that have congruence
+        psos_to_cos_mapping = {
+            1: 1,   # OFF -> OFF
+            2: 2,   # NOT_READY -> NOT_READY  
+            3: 3,   # READY -> READY
+            4: 4,   # INITIALISING -> INITIALISING
+            5: 5,   # INITIALISED -> INITIALISED
+            6: 6,   # EXECUTING -> EXECUTING
+            7: 7,   # POST_PULSE_CHECKS -> POST_PULSE_CHECKS
+            8: 9,   # TERMINATING -> ABORTING (closest equivalent)
+            9: 9,   # ABORTING -> ABORTING
+            10: 9,  # PLANT_ABORT_91 -> ABORTING (closest equivalent)
+            11: 9,  # INHIBIT_NEXT_PULSE -> ABORTING (closest equivalent)
+            12: 11, # PSOS LOCAL -> COS LOCAL
+            13: 4,  # CONFIGURE -> INITIALISING (closest equivalent)
+            14: 9   # PLANT_ABORT_92 -> ABORTING (closest equivalent)
+        }
+        
+        # Map PSOS value to equivalent COS value, then get COS state
+        cos_equivalent_value = psos_to_cos_mapping.get(psos_value, 1)  # Default to OFF
+        cos_state = self.cos_operator.get_cos_state_by_value(cos_equivalent_value)
+        
+        # If we mapped to a different state, create a custom display state
+        # that shows the original PSOS state name but uses COS colors
+        if psos_value != cos_equivalent_value and cos_state:
+            psos_state_names = {
+                8: 'TERMINATING',
+                10: 'PLANT_ABORT_91', 
+                11: 'INHIBIT_NEXT_PULSE',
+                13: 'CONFIGURE',
+                14: 'PLANT_ABORT_92'
+            }
+            
+            if psos_value in psos_state_names:
+                # Create a custom state object that shows PSOS name with COS color
+                class CustomDisplayState:
+                    def __init__(self, psos_name, cos_color, psos_value):
+                        self.state_name = psos_name
+                        self.color = cos_color
+                        self.value = psos_value
+                
+                return CustomDisplayState(
+                    psos_state_names[psos_value], 
+                    cos_state.color, 
+                    psos_value
+                )
+        
+        return cos_state
 
     def read_iop_status(self) -> Dict[str, Optional[int]]:
         """Read IOP status for all systems from FPIS"""
@@ -586,7 +642,7 @@ class MainGUI:
             labels['PSOS'].config(text=text, background=color, foreground="black")
 
     def update_fpis_display(self, state: Optional[SystemState]):
-        """Update FPIS status display"""
+        """Update FPIS status display (shows PSOS state mapped to COS equivalent)"""
         if 'FPIS' not in self.status_labels:
             return
         
