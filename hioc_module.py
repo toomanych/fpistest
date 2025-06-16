@@ -9,7 +9,6 @@ import threading
 import time
 import os
 from typing import Dict, List, Optional, Tuple, Any, Callable
-from enum import Enum
 from opcua import Client, ua
 import logging
 
@@ -19,16 +18,6 @@ logger = logging.getLogger(__name__)
 from hioc_operator import HIOCOperator, HIOCOperationConfig, HIOCOperationType, HIOCStep
 from sup_operator import SUPOperator, SUPOperationConfig
 from hioc_sup_validator import HIOCSUPValidator, ValidationResult
-
-
-class HIOCDialogOperationType(Enum):
-    """HIOC Dialog operation types"""
-    THRESHOLD = "threshold"
-    OVERRIDE_SET = "override_set"
-    OVERRIDE_UNSET = "override_unset"
-    DISABLE = "disable"
-    ENABLE = "enable"
-    PARAMETER_SET = "parameter_set"
 
 
 class ServerConnection:
@@ -133,48 +122,441 @@ class HIOCDialog:
             
             # Store reference to parameter set radio button
             if value == "parameter_set":
-                self.parameter_set_radio = rb
-                
-        # File selection frame (initially hidden)
-        self.file_frame = ttk.LabelFrame(self.dialog, text="Parameter File Selection", padding="5")
-        
-        self.file_path_var = tk.StringVar()
-        file_entry = ttk.Entry(self.file_frame, textvariable=self.file_path_var, width=50, state="readonly")
-        file_entry.pack(side="left", padx=(0, 5))
-        
-        ttk.Button(self.file_frame, text="Browse...", 
-                  command=self.browse_parameter_file).pack(side="left")
-                  
-        self.file_status_label = ttk.Label(self.file_frame, text="", foreground="blue")
-        self.file_status_label.pack(side="left", padx=(10, 0))
-        
-        # Progress frame
-        progress_frame = ttk.LabelFrame(self.dialog, text="Progress", padding="5")
-        progress_frame.pack(fill="x", padx=10, pady=5)
-        
-        self.progress_var = tk.StringVar(value="Ready to start")
-        ttk.Label(progress_frame, textvariable=self.progress_var).pack()
-        
-        # Log frame
-        log_frame = ttk.LabelFrame(self.dialog, text="Operation Log", padding="5")
-        log_frame.pack(fill="both", expand=True, padx=10, pady=5)
-        
-        self.log_text = tk.Text(log_frame, height=12, width=80)
-        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=log_scroll.set)
-        self.log_text.pack(side="left", fill="both", expand=True)
-        log_scroll.pack(side="right", fill="y")
+                self.update_progress("Dual threshold selection cancelled")
+            self.operation_in_progress = False
         
         # Button frame
-        button_frame = ttk.Frame(self.dialog)
-        button_frame.pack(fill="x", padx=10, pady=10)
+        button_frame = ttk.Frame(selection_dialog)
+        button_frame.pack(pady=10)
         
-        ttk.Button(button_frame, text="Start Operation", 
+        ttk.Button(button_frame, text="Select", command=on_dual_threshold_select).pack(side="left", padx=5)
+        ttk.Button(button_frame, text="Cancel", command=on_dual_threshold_cancel).pack(side="left", padx=5)
+
+    def continue_threshold_operation(self, server: str, fid: str, threshold_cc: int):
+        """Continue with threshold operation after selection"""
+        thread = threading.Thread(target=self.execute_threshold_operation, 
+                                args=(server, fid, threshold_cc), daemon=True)
+        thread.start()
+
+    def continue_dual_threshold_operation(self, fid: str, threshold_cc: int):
+        """Continue with dual threshold operation after selection"""
+        thread = threading.Thread(target=self.execute_dual_threshold_operation, 
+                                args=(fid, threshold_cc), daemon=True)
+        thread.start()
+
+    def execute_threshold_operation(self, server: str, fid: str, threshold_cc: int):
+        """Execute threshold operation using HIOCOperator"""
+        server_info = self.servers[server]
+        
+        # Validate connection
+        if not server_info.connected or not server_info.client:
+            self.dialog.after(0, self.update_progress, "{} not connected".format(server))
+            self.operation_in_progress = False
+            return
+        
+        # Create HIOCOperator configuration for threshold with connected client
+        config = HIOCOperationConfig(
+            client=server_info.client,  # Use existing connection
+            controller_id=server_info.controller_id,
+            fid=fid,
+            operation_type=HIOCOperationType.THRESHOLD,
+            threshold_value=threshold_cc,
+            progress_callback=lambda msg: self.dialog.after(0, self.update_progress, msg)
+        )
+        
+        # Execute operation
+        operator = HIOCOperator(config)
+        success = operator.execute_operation()
+        
+        # Show results
+        if success:
+            self.dialog.after(0, self.update_progress, "✓ Threshold operation completed successfully")
+        else:
+            self.dialog.after(0, self.update_progress, "✗ Threshold operation failed")
+            abort_analysis = operator.get_abort_analysis()
+            self.dialog.after(0, self.log_message, "--- ABORT ANALYSIS ---")
+            self.dialog.after(0, self.log_message, abort_analysis)
+        
+        self.operation_in_progress = False
+
+    def execute_dual_threshold_operation(self, fid: str, threshold_cc: int):
+        """Execute threshold operation on both CG1 and CG2 (CG1 first, then CG2 if CG1 succeeds)"""
+        try:
+            # Execute on CG1 first
+            self.dialog.after(0, self.update_progress, "Starting CG1 threshold operation...")
+            
+            cg1_server_info = self.servers['CG1']
+            if not cg1_server_info.connected or not cg1_server_info.client:
+                self.dialog.after(0, self.update_progress, "CG1 not connected")
+                self.operation_in_progress = False
+                return
+            
+            cg1_config = HIOCOperationConfig(
+                client=cg1_server_info.client,  # Use existing connection
+                controller_id=cg1_server_info.controller_id,
+                fid=fid,
+                operation_type=HIOCOperationType.THRESHOLD,
+                threshold_value=threshold_cc,
+                progress_callback=lambda msg: self.dialog.after(0, self.update_progress, "CG1: {}".format(msg))
+            )
+            
+            cg1_operator = HIOCOperator(cg1_config)
+            cg1_success = cg1_operator.execute_operation()
+            
+            if cg1_success:
+                self.dialog.after(0, self.update_progress, "✓ CG1 threshold operation completed - Starting CG2...")
+                
+                # Execute on CG2 automatically since CG1 succeeded
+                cg2_server_info = self.servers['CG2']
+                if not cg2_server_info.connected or not cg2_server_info.client:
+                    self.dialog.after(0, self.update_progress, "CG2 not connected")
+                    self.operation_in_progress = False
+                    return
+                
+                cg2_config = HIOCOperationConfig(
+                    client=cg2_server_info.client,  # Use existing connection
+                    controller_id=cg2_server_info.controller_id,
+                    fid=fid,
+                    operation_type=HIOCOperationType.THRESHOLD,
+                    threshold_value=threshold_cc,
+                    progress_callback=lambda msg: self.dialog.after(0, self.update_progress, "CG2: {}".format(msg))
+                )
+                
+                cg2_operator = HIOCOperator(cg2_config)
+                cg2_success = cg2_operator.execute_operation()
+                
+                if cg2_success:
+                    self.dialog.after(0, self.update_progress, "✓ Both CG1 and CG2 threshold operations completed successfully")
+                else:
+                    self.dialog.after(0, self.update_progress, "✗ CG2 threshold operation failed")
+                    abort_analysis = cg2_operator.get_abort_analysis()
+                    self.dialog.after(0, self.log_message, "--- CG2 ABORT ANALYSIS ---")
+                    self.dialog.after(0, self.log_message, abort_analysis)
+                    
+            else:
+                self.dialog.after(0, self.update_progress, "✗ CG1 threshold operation failed - CG2 operation cancelled")
+                abort_analysis = cg1_operator.get_abort_analysis()
+                self.dialog.after(0, self.log_message, "--- CG1 ABORT ANALYSIS ---")
+                self.dialog.after(0, self.log_message, abort_analysis)
+                
+        except Exception as e:
+            self.dialog.after(0, self.update_progress, "Dual threshold operation error: {}".format(e))
+            
+        self.operation_in_progress = False
+
+    def execute_hioc_operation(self, server: str, fid: str, operation: str):
+        """Execute HIOC operation using HIOCOperator"""
+        server_info = self.servers[server]
+        
+        # Validate connection
+        if not server_info.connected or not server_info.client:
+            self.dialog.after(0, self.update_progress, "{} not connected".format(server))
+            self.operation_in_progress = False
+            return
+        
+        # Map dialog operation to HIOCOperationType
+        operation_mapping = {
+            "override_set": HIOCOperationType.OVERRIDE_SET,
+            "override_unset": HIOCOperationType.OVERRIDE_UNSET,
+            "disable": HIOCOperationType.DISABLE,
+            "enable": HIOCOperationType.ENABLE
+        }
+        
+        hioc_operation = operation_mapping.get(operation)
+        if not hioc_operation:
+            self.dialog.after(0, self.update_progress, "Invalid HIOC operation: {}".format(operation))
+            self.operation_in_progress = False
+            return
+        
+        # Create HIOCOperator configuration with connected client
+        config = HIOCOperationConfig(
+            client=server_info.client,  # Use existing connection
+            controller_id=server_info.controller_id,
+            fid=fid,
+            operation_type=hioc_operation,
+            progress_callback=lambda msg: self.dialog.after(0, self.update_progress, msg)
+        )
+        
+        # Execute operation
+        operator = HIOCOperator(config)
+        success = operator.execute_operation()
+        
+        # Show results
+        if success:
+            self.dialog.after(0, self.update_progress, "✓ Operation completed successfully")
+        else:
+            self.dialog.after(0, self.update_progress, "✗ Operation failed")
+            abort_analysis = operator.get_abort_analysis()
+            self.dialog.after(0, self.log_message, abort_analysis)
+        
+        self.operation_in_progress = False
+
+    def execute_sup_operation(self, server: str, fid: str):
+        """Execute SUP operation using SUPOperator"""
+        server_info = self.servers[server]
+        
+        # Validate connection
+        if not server_info.connected or not server_info.client:
+            self.dialog.after(0, self.update_progress, "{} not connected".format(server))
+            self.operation_in_progress = False
+            return
+        
+        # Create SUPOperator configuration with connected client
+        config = SUPOperationConfig(
+            client=server_info.client,  # Use existing connection
+            controller_id=server_info.controller_id,
+            fid=fid,
+            operation_type=HIOCOperationType.STRUCTURED_PARAMS,
+            csv_file_path=self.selected_file_path,
+            progress_callback=lambda msg: self.dialog.after(0, self.update_progress, msg)
+        )
+        
+        # Execute operation
+        operator = SUPOperator(config)
+        success = operator.execute_operation()
+        
+        # Show results
+        if success:
+            self.dialog.after(0, self.update_progress, "✓ SUP operation completed successfully")
+        else:
+            self.dialog.after(0, self.update_progress, "✗ SUP operation failed")
+            abort_analysis = operator.get_abort_analysis()
+            self.dialog.after(0, self.log_message, abort_analysis)
+        
+        self.operation_in_progress = False
+
+    def execute_dual_hioc_operation(self, fid: str, operation: str):
+        """Execute HIOC operation on both CG1 and CG2 (CG1 first, then CG2 if CG1 succeeds)"""
+        try:
+            # Execute on CG1 first
+            self.dialog.after(0, self.update_progress, "Starting CG1 operation...")
+            
+            cg1_success = self.execute_single_hioc_operation_sync('CG1', fid, operation)
+            
+            if cg1_success:
+                self.dialog.after(0, self.update_progress, "✓ CG1 completed - Starting CG2 operation...")
+                
+                # Execute on CG2 automatically since CG1 succeeded
+                cg2_success = self.execute_single_hioc_operation_sync('CG2', fid, operation)
+                
+                if cg2_success:
+                    self.dialog.after(0, self.update_progress, "✓ Both CG1 and CG2 operations completed successfully")
+                else:
+                    self.dialog.after(0, self.update_progress, "✗ CG2 operation failed")
+            else:
+                self.dialog.after(0, self.update_progress, "✗ CG1 operation failed - CG2 operation cancelled")
+                
+        except Exception as e:
+            self.dialog.after(0, self.update_progress, "Dual HIOC operation error: {}".format(e))
+            
+        self.operation_in_progress = False
+
+    def execute_dual_sup_operation(self, fid: str):
+        """Execute SUP operation on both CG1 and CG2 (CG1 first, then CG2 if CG1 succeeds)"""
+        try:
+            # Execute on CG1 first
+            self.dialog.after(0, self.update_progress, "Starting CG1 SUP operation...")
+            
+            cg1_success = self.execute_single_sup_operation_sync('CG1', fid)
+            
+            if cg1_success:
+                self.dialog.after(0, self.update_progress, "✓ CG1 SUP completed - Starting CG2 SUP operation...")
+                
+                # Execute on CG2 automatically since CG1 succeeded
+                cg2_success = self.execute_single_sup_operation_sync('CG2', fid)
+                
+                if cg2_success:
+                    self.dialog.after(0, self.update_progress, "✓ Both CG1 and CG2 SUP operations completed successfully")
+                else:
+                    self.dialog.after(0, self.update_progress, "✗ CG2 SUP operation failed")
+            else:
+                self.dialog.after(0, self.update_progress, "✗ CG1 SUP operation failed - CG2 operation cancelled")
+                
+        except Exception as e:
+            self.dialog.after(0, self.update_progress, "Dual SUP operation error: {}".format(e))
+            
+        self.operation_in_progress = False
+
+    def execute_single_hioc_operation_sync(self, server: str, fid: str, operation: str) -> bool:
+        """Execute HIOC operation synchronously and return success status"""
+        server_info = self.servers[server]
+        
+        # Validate connection
+        if not server_info.connected or not server_info.client:
+            self.dialog.after(0, self.update_progress, "{}: Not connected".format(server))
+            return False
+        
+        # Map dialog operation to HIOCOperationType
+        operation_mapping = {
+            "override_set": HIOCOperationType.OVERRIDE_SET,
+            "override_unset": HIOCOperationType.OVERRIDE_UNSET,
+            "disable": HIOCOperationType.DISABLE,
+            "enable": HIOCOperationType.ENABLE
+        }
+        
+        hioc_operation = operation_mapping.get(operation)
+        if not hioc_operation:
+            self.dialog.after(0, self.update_progress, "{}: Invalid HIOC operation: {}".format(
+                server, operation))
+            return False
+        
+        # Create HIOCOperator configuration with connected client
+        config = HIOCOperationConfig(
+            client=server_info.client,  # Use existing connection
+            controller_id=server_info.controller_id,
+            fid=fid,
+            operation_type=hioc_operation,
+            progress_callback=lambda msg: self.dialog.after(0, self.update_progress, "{}: {}".format(server, msg))
+        )
+        
+        # Execute operation
+        operator = HIOCOperator(config)
+        success = operator.execute_operation()
+        
+        # Show results
+        if success:
+            self.dialog.after(0, self.update_progress, "✓ {} operation completed successfully".format(server))
+        else:
+            self.dialog.after(0, self.update_progress, "✗ {} operation failed".format(server))
+            abort_analysis = operator.get_abort_analysis()
+            self.dialog.after(0, self.log_message, "--- {} ABORT ANALYSIS ---".format(server))
+            self.dialog.after(0, self.log_message, abort_analysis)
+        
+        return success
+
+    def execute_single_sup_operation_sync(self, server: str, fid: str) -> bool:
+        """Execute SUP operation synchronously and return success status"""
+        server_info = self.servers[server]
+        
+        # Validate connection
+        if not server_info.connected or not server_info.client:
+            self.dialog.after(0, self.update_progress, "{}: Not connected".format(server))
+            return False
+        
+        # Create SUPOperator configuration with connected client
+        config = SUPOperationConfig(
+            client=server_info.client,  # Use existing connection
+            controller_id=server_info.controller_id,
+            fid=fid,
+            operation_type=HIOCOperationType.STRUCTURED_PARAMS,
+            csv_file_path=self.selected_file_path,
+            progress_callback=lambda msg: self.dialog.after(0, self.update_progress, "{}: {}".format(server, msg))
+        )
+        
+        # Execute operation
+        operator = SUPOperator(config)
+        success = operator.execute_operation()
+        
+        # Show results
+        if success:
+            self.dialog.after(0, self.update_progress, "✓ {} SUP operation completed successfully".format(server))
+        else:
+            self.dialog.after(0, self.update_progress, "✗ {} SUP operation failed".format(server))
+            abort_analysis = operator.get_abort_analysis()
+            self.dialog.after(0, self.log_message, "--- {} SUP ABORT ANALYSIS ---".format(server))
+            self.dialog.after(0, self.log_message, abort_analysis)
+        
+        return success
+
+    def abort_operation(self):
+        """Abort current operation"""
+        if not self.operation_in_progress:
+            return
+        
+        if self.current_operator and hasattr(self.current_operator, 'abort_operation'):
+            self.current_operator.abort_operation()
+            self.update_progress("Operation aborted")
+        
+        self.operation_in_progress = False
+
+    def close_dialog(self):
+        """Close dialog"""
+        if self.operation_in_progress:
+            result = messagebox.askyesno("Operation in Progress", 
+                                       "An operation is in progress. Abort and close?")
+            if result:
+                self.abort_operation()
+            else:
+                return
+        
+        if self.dialog:
+            self.dialog.destroy()
+
+
+def create_hioc_dialog(parent, servers: Dict[str, ServerConnection]):
+    """
+    Factory function to create and return a HIOC dialog instance.
+    
+    Args:
+        parent: Parent tkinter widget (typically root window)
+        servers: Dictionary of server connections {name: ServerConnection}
+                Only CG1 and CG2 servers are used for HIOC operations
+    
+    Returns:
+        HIOCDialog: Configured HIOC dialog instance ready to show()
+        
+    Raises:
+        ValueError: If no valid CG servers are provided
+        
+    Example:
+        dialog = create_hioc_dialog(root, servers)
+        dialog.show()  # Display the dialog
+    """
+    # Validate that we have the required server connections
+    if not servers:
+        raise ValueError("Server connections dictionary cannot be empty")
+    
+    # Check for CG1/CG2 availability (HIOC operations require these)
+    cg_servers = {name: conn for name, conn in servers.items() 
+                  if name in ['CG1', 'CG2']}
+    
+    if not cg_servers:
+        raise ValueError("HIOC operations require CG1 and/or CG2 server connections")
+    
+    # Create and return the dialog instance
+    # The dialog will handle its own initialization and widget creation
+    dialog = HIOCDialog(parent, servers)
+    
+    #return dialogt="Parameter File Selection", padding="5")
+        
+    self.file_path_var = tk.StringVar()
+    file_entry = ttk.Entry(self.file_frame, textvariable=self.file_path_var, width=50, state="readonly")
+    file_entry.pack(side="left", padx=(0, 5))
+        
+    ttk.Button(self.file_frame, text="Browse...", 
+                  command=self.browse_parameter_file).pack(side="left")
+                  
+    self.file_status_label = ttk.Label(self.file_frame, text="", foreground="blue")
+    self.file_status_label.pack(side="left", padx=(10, 0))
+        
+    # Progress frame
+    progress_frame = ttk.LabelFrame(self.dialog, text="Progress", padding="5")
+    progress_frame.pack(fill="x", padx=10, pady=5)
+        
+    self.progress_var = tk.StringVar(value="Ready to start")
+    ttk.Label(progress_frame, textvariable=self.progress_var).pack()
+        
+    # Log frame
+    log_frame = ttk.LabelFrame(self.dialog, text="Operation Log", padding="5")
+    log_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        
+    self.log_text = tk.Text(log_frame, height=12, width=80)
+    log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+    self.log_text.configure(yscrollcommand=log_scroll.set)
+    self.log_text.pack(side="left", fill="both", expand=True)
+    log_scroll.pack(side="right", fill="y")
+        
+    # Button frame
+    button_frame = ttk.Frame(self.dialog)
+    button_frame.pack(fill="x", padx=10, pady=10)
+        
+    ttk.Button(button_frame, text="Start Operation", 
                   command=self.start_operation).pack(side="left", padx=5)
-        ttk.Button(button_frame, text="Abort", 
+    ttk.Button(button_frame, text="Abort", 
                   command=self.abort_operation).pack(side="left", padx=5)
-        ttk.Button(button_frame, text="Close", 
+    ttk.Button(button_frame, text="Close", 
                   command=self.close_dialog).pack(side="right", padx=5)
+    return dialog
 
     def update_server_options(self):
         """Update available server options"""
@@ -390,7 +772,7 @@ class HIOCDialog:
                 )
             except Exception as e:
                 self.file_status_label.config(
-                    text=f"✗ Error: {str(e)}", 
+                    text="✗ Error: {}".format(str(e)), 
                     foreground="red"
                 )
                 self.selected_file_path = None
@@ -425,7 +807,7 @@ class HIOCDialog:
         """Add message to log"""
         if self.log_text:
             timestamp = time.strftime('%H:%M:%S')
-            self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+            self.log_text.insert(tk.END, "[{}] {}\n".format(timestamp, message))
             self.log_text.see(tk.END)
 
     def update_progress(self, message: str):
@@ -468,7 +850,12 @@ class HIOCDialog:
     def execute_single_operation(self, server: str, fid: str, operation: str):
         """Execute operation on single server"""
         try:
+            # Validate connection before creating operator
             server_info = self.servers[server]
+            if not server_info.connected or not server_info.client:
+                self.dialog.after(0, self.update_progress, "{} not connected".format(server))
+                self.operation_in_progress = False
+                return
             
             if operation == "threshold":
                 # Need HTT values first, then show threshold selection
@@ -493,6 +880,12 @@ class HIOCDialog:
             
             cg1_client = self.servers['CG1'].client
             cg2_client = self.servers['CG2'].client
+            
+            # Validate both clients are available
+            if not cg1_client or not cg2_client:
+                self.dialog.after(0, self.update_progress, "CG1 or CG2 client not available")
+                self.operation_in_progress = False
+                return
             
             self.validator = HIOCSUPValidator(cg1_client, cg2_client)
             validation_results = self.validator.validate_for_dual_hioc_operation(fid if operation == "parameter_set" else None)
@@ -527,10 +920,16 @@ class HIOCDialog:
         def htt_progress_callback(message: str):
             self.dialog.after(0, self.update_progress, message)
         
-        # Create temporary HIOCOperator just for HTT request
+        # Get connected client from main_gui
         server_info = self.servers[server]
+        if not server_info.connected or not server_info.client:
+            self.dialog.after(0, self.update_progress, "Server not connected")
+            self.operation_in_progress = False
+            return
+        
+        # Create temporary HIOCOperator config with connected client
         config = HIOCOperationConfig(
-            server_url=server_info.url,
+            client=server_info.client,  # Use existing connection
             controller_id=server_info.controller_id,
             fid=fid,
             operation_type=HIOCOperationType.THRESHOLD,  # Will be overridden later
@@ -539,13 +938,8 @@ class HIOCDialog:
         
         temp_operator = HIOCOperator(config)
         
-        # Connect and perform HTT request (auxiliary step)
+        # Perform HTT request (auxiliary step)
         try:
-            if not temp_operator._connect_to_server():
-                self.dialog.after(0, self.update_progress, "Failed to connect for HTT request")
-                self.operation_in_progress = False
-                return
-            
             # Perform HTT request (Flag=21 auxiliary step)
             if temp_operator._perform_htt_request():
                 # Read the populated HTT values
@@ -561,15 +955,8 @@ class HIOCDialog:
                 self.operation_in_progress = False
                 
         except Exception as e:
-            self.dialog.after(0, self.update_progress, f"HTT request error: {e}")
+            self.dialog.after(0, self.update_progress, "HTT request error: {}".format(e))
             self.operation_in_progress = False
-        finally:
-            # Cleanup temporary operator connection
-            try:
-                if temp_operator.client:
-                    temp_operator.client.disconnect()
-            except:
-                pass
 
     def read_htt_values(self, client: Client) -> Optional[Dict[int, Any]]:
         """Read HTT threshold values from a server"""
@@ -579,17 +966,17 @@ class HIOCDialog:
             
             for i in range(1, 16):
                 try:
-                    htt_node = objects.get_child(["1:HTT", f"1:TH{i}"])
+                    htt_node = objects.get_child(["1:HTT", "1:TH{}".format(i)])
                     value = htt_node.get_value()
                     htt_values[i] = value
                 except Exception as e:
-                    logger.warning(f"Failed to read TH{i}: {e}")
+                    logger.warning("Failed to read TH{}: {}".format(i, e))
                     htt_values[i] = None
             
             return htt_values
             
         except Exception as e:
-            logger.error(f"Failed to read HTT values: {e}")
+            logger.error("Failed to read HTT values: {}".format(e))
             return None
 
     def show_threshold_selection(self, server: str, fid: str, htt_values: Dict[int, Any]):
@@ -723,329 +1110,4 @@ class HIOCDialog:
         
         def on_dual_threshold_cancel():
             selection_dialog.destroy()
-            self.update_progress("Dual threshold selection cancelled")
-            self.operation_in_progress = False
-        
-        # Button frame
-        button_frame = ttk.Frame(selection_dialog)
-        button_frame.pack(pady=10)
-        
-        ttk.Button(button_frame, text="Select", command=on_dual_threshold_select).pack(side="left", padx=5)
-        ttk.Button(button_frame, text="Cancel", command=on_dual_threshold_cancel).pack(side="left", padx=5)
-
-    def continue_threshold_operation(self, server: str, fid: str, threshold_cc: int):
-        """Continue with threshold operation after selection"""
-        thread = threading.Thread(target=self.execute_threshold_operation, 
-                                args=(server, fid, threshold_cc), daemon=True)
-        thread.start()
-
-    def continue_dual_threshold_operation(self, fid: str, threshold_cc: int):
-        """Continue with dual threshold operation after selection"""
-        thread = threading.Thread(target=self.execute_dual_threshold_operation, 
-                                args=(fid, threshold_cc), daemon=True)
-        thread.start()
-
-    def execute_threshold_operation(self, server: str, fid: str, threshold_cc: int):
-        """Execute threshold operation using HIOCOperator"""
-        server_info = self.servers[server]
-        
-        # Create HIOCOperator configuration for threshold
-        config = HIOCOperationConfig(
-            server_url=server_info.url,
-            controller_id=server_info.controller_id,
-            fid=fid,
-            operation_type=HIOCOperationType.THRESHOLD,
-            threshold_value=threshold_cc,
-            progress_callback=lambda msg: self.dialog.after(0, self.update_progress, msg)
-        )
-        
-        # Execute operation
-        operator = HIOCOperator(config)
-        success = operator.execute_operation()
-        
-        # Show results
-        if success:
-            self.dialog.after(0, self.update_progress, "✓ Threshold operation completed successfully")
-        else:
-            self.dialog.after(0, self.update_progress, "✗ Threshold operation failed")
-            abort_analysis = operator.get_abort_analysis()
-            self.dialog.after(0, self.log_message, "--- ABORT ANALYSIS ---")
-            self.dialog.after(0, self.log_message, abort_analysis)
-        
-        self.operation_in_progress = False
-
-    def execute_dual_threshold_operation(self, fid: str, threshold_cc: int):
-        """Execute threshold operation on both CG1 and CG2 (CG1 first, then CG2 if CG1 succeeds)"""
-        try:
-            # Execute on CG1 first
-            self.dialog.after(0, self.update_progress, "Starting CG1 threshold operation...")
-            
-            cg1_server_info = self.servers['CG1']
-            cg1_config = HIOCOperationConfig(
-                server_url=cg1_server_info.url,
-                controller_id=cg1_server_info.controller_id,
-                fid=fid,
-                operation_type=HIOCOperationType.THRESHOLD,
-                threshold_value=threshold_cc,
-                progress_callback=lambda msg: self.dialog.after(0, self.update_progress, "CG1: {}".format(msg))
-            )
-            
-            cg1_operator = HIOCOperator(cg1_config)
-            cg1_success = cg1_operator.execute_operation()
-            
-            if cg1_success:
-                self.dialog.after(0, self.update_progress, "✓ CG1 threshold operation completed - Starting CG2...")
-                
-                # Execute on CG2 automatically since CG1 succeeded
-                cg2_server_info = self.servers['CG2']
-                cg2_config = HIOCOperationConfig(
-                    server_url=cg2_server_info.url,
-                    controller_id=cg2_server_info.controller_id,
-                    fid=fid,
-                    operation_type=HIOCOperationType.THRESHOLD,
-                    threshold_value=threshold_cc,
-                    progress_callback=lambda msg: self.dialog.after(0, self.update_progress, "CG2: {}".format(msg))
-                )
-                
-                cg2_operator = HIOCOperator(cg2_config)
-                cg2_success = cg2_operator.execute_operation()
-                
-                if cg2_success:
-                    self.dialog.after(0, self.update_progress, "✓ Both CG1 and CG2 threshold operations completed successfully")
-                else:
-                    self.dialog.after(0, self.update_progress, "✗ CG2 threshold operation failed")
-                    abort_analysis = cg2_operator.get_abort_analysis()
-                    self.dialog.after(0, self.log_message, "--- CG2 ABORT ANALYSIS ---")
-                    self.dialog.after(0, self.log_message, abort_analysis)
-                    
-            else:
-                self.dialog.after(0, self.update_progress, "✗ CG1 threshold operation failed - CG2 operation cancelled")
-                abort_analysis = cg1_operator.get_abort_analysis()
-                self.dialog.after(0, self.log_message, "--- CG1 ABORT ANALYSIS ---")
-                self.dialog.after(0, self.log_message, abort_analysis)
-                
-        except Exception as e:
-            self.dialog.after(0, self.update_progress, "Dual threshold operation error: {}".format(e))
-            
-        self.operation_in_progress = False
-
-    def execute_hioc_operation(self, server: str, fid: str, operation: str):
-        """Execute HIOC operation using HIOCOperator"""
-        server_info = self.servers[server]
-        
-        # Map dialog operation to HIOCOperationType
-        operation_mapping = {
-            "override_set": HIOCOperationType.OVERRIDE_SET,
-            "override_unset": HIOCOperationType.OVERRIDE_UNSET,
-            "disable": HIOCOperationType.DISABLE,
-            "enable": HIOCOperationType.ENABLE
-        }
-        
-        hioc_operation = operation_mapping.get(operation)
-        if not hioc_operation:
-            self.dialog.after(0, self.update_progress, f"Invalid HIOC operation: {operation}")
-            self.operation_in_progress = False
-            return
-        
-        # Create HIOCOperator configuration
-        config = HIOCOperationConfig(
-            server_url=server_info.url,
-            controller_id=server_info.controller_id,
-            fid=fid,
-            operation_type=hioc_operation,
-            progress_callback=lambda msg: self.dialog.after(0, self.update_progress, msg)
-        )
-        
-        # Execute operation
-        operator = HIOCOperator(config)
-        success = operator.execute_operation()
-        
-        # Show results
-        if success:
-            self.dialog.after(0, self.update_progress, "✓ Operation completed successfully")
-        else:
-            self.dialog.after(0, self.update_progress, "✗ Operation failed")
-            abort_analysis = operator.get_abort_analysis()
-            self.dialog.after(0, self.log_message, abort_analysis)
-        
-        self.operation_in_progress = False
-
-    def execute_sup_operation(self, server: str, fid: str):
-        """Execute SUP operation using SUPOperator"""
-        server_info = self.servers[server]
-        
-        # Create SUPOperator configuration
-        config = SUPOperationConfig(
-            server_url=server_info.url,
-            controller_id=server_info.controller_id,
-            fid=fid,
-            operation_type=HIOCOperationType.STRUCTURED_PARAMS,
-            csv_file_path=self.selected_file_path,
-            progress_callback=lambda msg: self.dialog.after(0, self.update_progress, msg)
-        )
-        
-        # Execute operation
-        operator = SUPOperator(config)
-        success = operator.execute_operation()
-        
-        # Show results
-        if success:
-            self.dialog.after(0, self.update_progress, "✓ SUP operation completed successfully")
-        else:
-            self.dialog.after(0, self.update_progress, "✗ SUP operation failed")
-            abort_analysis = operator.get_abort_analysis()
-            self.dialog.after(0, self.log_message, abort_analysis)
-        
-        self.operation_in_progress = False
-
-    def execute_dual_hioc_operation(self, fid: str, operation: str):
-        """Execute HIOC operation on both CG1 and CG2 (CG1 first, then CG2 if CG1 succeeds)"""
-        try:
-            # Execute on CG1 first
-            self.dialog.after(0, self.update_progress, "Starting CG1 operation...")
-            
-            cg1_success = self.execute_single_hioc_operation_sync('CG1', fid, operation)
-            
-            if cg1_success:
-                self.dialog.after(0, self.update_progress, "✓ CG1 completed - Starting CG2 operation...")
-                
-                # Execute on CG2 automatically since CG1 succeeded
-                cg2_success = self.execute_single_hioc_operation_sync('CG2', fid, operation)
-                
-                if cg2_success:
-                    self.dialog.after(0, self.update_progress, "✓ Both CG1 and CG2 operations completed successfully")
-                else:
-                    self.dialog.after(0, self.update_progress, "✗ CG2 operation failed")
-            else:
-                self.dialog.after(0, self.update_progress, "✗ CG1 operation failed - CG2 operation cancelled")
-                
-        except Exception as e:
-            self.dialog.after(0, self.update_progress, f"Dual HIOC operation error: {e}")
-            
-        self.operation_in_progress = False
-
-    def execute_dual_sup_operation(self, fid: str):
-        """Execute SUP operation on both CG1 and CG2 (CG1 first, then CG2 if CG1 succeeds)"""
-        try:
-            # Execute on CG1 first
-            self.dialog.after(0, self.update_progress, "Starting CG1 SUP operation...")
-            
-            cg1_success = self.execute_single_sup_operation_sync('CG1', fid)
-            
-            if cg1_success:
-                self.dialog.after(0, self.update_progress, "✓ CG1 SUP completed - Starting CG2 SUP operation...")
-                
-                # Execute on CG2 automatically since CG1 succeeded
-                cg2_success = self.execute_single_sup_operation_sync('CG2', fid)
-                
-                if cg2_success:
-                    self.dialog.after(0, self.update_progress, "✓ Both CG1 and CG2 SUP operations completed successfully")
-                else:
-                    self.dialog.after(0, self.update_progress, "✗ CG2 SUP operation failed")
-            else:
-                self.dialog.after(0, self.update_progress, "✗ CG1 SUP operation failed - CG2 operation cancelled")
-                
-        except Exception as e:
-            self.dialog.after(0, self.update_progress, f"Dual SUP operation error: {e}")
-            
-        self.operation_in_progress = False
-
-    def execute_single_hioc_operation_sync(self, server: str, fid: str, operation: str) -> bool:
-        """Execute HIOC operation synchronously and return success status"""
-        server_info = self.servers[server]
-        
-        # Map dialog operation to HIOCOperationType
-        operation_mapping = {
-            "override_set": HIOCOperationType.OVERRIDE_SET,
-            "override_unset": HIOCOperationType.OVERRIDE_UNSET,
-            "disable": HIOCOperationType.DISABLE,
-            "enable": HIOCOperationType.ENABLE
-        }
-        
-        hioc_operation = operation_mapping.get(operation)
-        if not hioc_operation:
-            self.dialog.after(0, self.update_progress, "{}: Invalid HIOC operation: {}".format(
-                server, operation))
-            return False
-        
-        # Create HIOCOperator configuration
-        config = HIOCOperationConfig(
-            server_url=server_info.url,
-            controller_id=server_info.controller_id,
-            fid=fid,
-            operation_type=hioc_operation,
-            progress_callback=lambda msg: self.dialog.after(0, self.update_progress, "{}: {}".format(server, msg))
-        )
-        
-        # Execute operation
-        operator = HIOCOperator(config)
-        success = operator.execute_operation()
-        
-        # Show results
-        if success:
-            self.dialog.after(0, self.update_progress, "✓ {} operation completed successfully".format(server))
-        else:
-            self.dialog.after(0, self.update_progress, "✗ {} operation failed".format(server))
-            abort_analysis = operator.get_abort_analysis()
-            self.dialog.after(0, self.log_message, "--- {} ABORT ANALYSIS ---".format(server))
-            self.dialog.after(0, self.log_message, abort_analysis)
-        
-        return success
-
-    def execute_single_sup_operation_sync(self, server: str, fid: str) -> bool:
-        """Execute SUP operation synchronously and return success status"""
-        server_info = self.servers[server]
-        
-        # Create SUPOperator configuration
-        config = SUPOperationConfig(
-            server_url=server_info.url,
-            controller_id=server_info.controller_id,
-            fid=fid,
-            operation_type=HIOCOperationType.STRUCTURED_PARAMS,
-            csv_file_path=self.selected_file_path,
-            progress_callback=lambda msg: self.dialog.after(0, self.update_progress, "{}: {}".format(server, msg))
-        )
-        
-        # Execute operation
-        operator = SUPOperator(config)
-        success = operator.execute_operation()
-        
-        # Show results
-        if success:
-            self.dialog.after(0, self.update_progress, "✓ {} SUP operation completed successfully".format(server))
-        else:
-            self.dialog.after(0, self.update_progress, "✗ {} SUP operation failed".format(server))
-            abort_analysis = operator.get_abort_analysis()
-            self.dialog.after(0, self.log_message, "--- {} SUP ABORT ANALYSIS ---".format(server))
-            self.dialog.after(0, self.log_message, abort_analysis)
-        
-        return success
-
-    def abort_operation(self):
-        """Abort current operation"""
-        if not self.operation_in_progress:
-            return
-        
-        if self.current_operator and hasattr(self.current_operator, 'abort_operation'):
-            self.current_operator.abort_operation()
-            self.update_progress("Operation aborted")
-        
-        self.operation_in_progress = False
-
-    def close_dialog(self):
-        """Close dialog"""
-        if self.operation_in_progress:
-            result = messagebox.askyesno("Operation in Progress", 
-                                       "An operation is in progress. Abort and close?")
-            if result:
-                self.abort_operation()
-            else:
-                return
-        
-        if self.dialog:
-            self.dialog.destroy()
-
-
-def create_hioc_dialog(parent, servers: Dict[str, ServerConnection]):
-    """Factory function to create HIOC dialog"""
-    return HIOCDialog(parent, servers)
+            self

@@ -10,7 +10,7 @@ import csv
 import time
 from typing import List, Optional
 from enum import Enum
-from opcua import ua
+from opcua import ua, Client
 
 # Import the base HIOCOperator
 from hioc_operator import HIOCOperator, HIOCOperationConfig, HIOCStep, HIOCStepResult, HIOCOperationType
@@ -38,9 +38,10 @@ class SUPStep(Enum):
 
 class SUPOperationConfig(HIOCOperationConfig):
     """Configuration for SUP operation - extends HIOC config"""
-    def __init__(self, server_url, controller_id, fid, operation_type, 
-                 csv_file_path=None, timeout_seconds=10.0, progress_callback=None):
-        super(SUPOperationConfig, self).__init__(server_url, controller_id, fid, operation_type, 
+    def __init__(self, client: Client, controller_id: int, fid: str, operation_type: HIOCOperationType, 
+                 csv_file_path: Optional[str] = None, timeout_seconds: float = 10.0, 
+                 progress_callback=None):
+        super(SUPOperationConfig, self).__init__(client, controller_id, fid, operation_type, 
                                                 None, timeout_seconds, progress_callback)
         self.csv_file_path = csv_file_path
 
@@ -52,17 +53,8 @@ class SUPOperator(HIOCOperator):
     """
     
     def __init__(self, config: SUPOperationConfig):
-        # Initialize parent with modified config for HIOC unlock operation
-        hioc_config = HIOCOperationConfig(
-            server_url=config.server_url,
-            controller_id=config.controller_id,
-            fid=config.fid,
-            operation_type=config.operation_type,
-            timeout_seconds=config.timeout_seconds,
-            progress_callback=config.progress_callback
-        )
-        
-        super(SUPOperator, self).__init__(hioc_config)
+        # Initialize parent with the client from config
+        super(SUPOperator, self).__init__(config)
         
         self.sup_config = config
         self.structured_parameters: List[int] = []
@@ -112,8 +104,8 @@ class SUPOperator(HIOCOperator):
             
             # Read FIDSize from common HTT registry (populated after Flag=21→22 sequence)
             # Note: HTT must be populated first via Flag=21 challenge before reading FIDSize
-            fid_size_path = ['HTT', 'FIDSize']  # Common HTT registry, not FID-specific
-            fid_size_node = self.client.get_node("ns=2;s=" + ".".join(fid_size_path))
+            objects = self.client.get_objects_node()
+            fid_size_node = objects.get_child(["1:HTT", "1:FIDSize"])  # Common HTT registry, not FID-specific
             fid_size = fid_size_node.get_value()
             
             self.is_sup_capable = fid_size > 1
@@ -328,31 +320,27 @@ class SUPOperator(HIOCOperator):
         try:
             self._report_progress("Populating CTFSS buffer...")
             
-            # CTFSS buffer paths
-            ctfss_paths = {
-                'CTR': ['CTFSS', 'CTR'],
-                'FLG': ['CTFSS', 'FLG'],
-                'MSG': ['CTFSS', 'MSG'],
-                'VALUE': ['CTFSS', 'VALUE'],
-                'DSIZE': ['CTFSS', 'DSIZE'],
-                'DATA': ['CTFSS', 'DATA']
-            }
+            # Get objects node
+            objects = self.client.get_objects_node()
             
-            # Get nodes
-            nodes = {}
-            for key, path in ctfss_paths.items():
-                nodes[key] = self.client.get_node("ns=2;s=" + ".".join(path))
+            # Get CTFSS nodes using proper browse paths
+            ctr_node = objects.get_child(["1:CTFSS", "1:CTR"])
+            flg_node = objects.get_child(["1:CTFSS", "1:FLG"])
+            msg_node = objects.get_child(["1:CTFSS", "1:MSG"])
+            value_node = objects.get_child(["1:CTFSS", "1:VALUE"])
+            dsize_node = objects.get_child(["1:CTFSS", "1:DSIZE"])
+            data_node = objects.get_child(["1:CTFSS", "1:DATA"])
             
             # Set metadata
-            nodes['CTR'].set_value(ua.Variant(self.config.controller_id, ua.VariantType.UInt32))
-            nodes['FLG'].set_value(ua.Variant(1, ua.VariantType.UInt32))
-            nodes['MSG'].set_value(ua.Variant(0, ua.VariantType.UInt32))
-            nodes['VALUE'].set_value(ua.Variant(0, ua.VariantType.UInt32))
-            nodes['DSIZE'].set_value(ua.Variant(len(self.structured_parameters), ua.VariantType.UInt32))
+            ctr_node.set_value(ua.Variant(self.config.controller_id, ua.VariantType.UInt32))
+            flg_node.set_value(ua.Variant(1, ua.VariantType.UInt32))
+            msg_node.set_value(ua.Variant(0, ua.VariantType.UInt32))
+            value_node.set_value(ua.Variant(0, ua.VariantType.UInt32))
+            dsize_node.set_value(ua.Variant(len(self.structured_parameters), ua.VariantType.UInt32))
             
             # Set parameter data as array
             data_variants = [ua.Variant(param, ua.VariantType.UInt32) for param in self.structured_parameters]
-            nodes['DATA'].set_value(data_variants)
+            data_node.set_value(data_variants)
             
             self._log_sup_step(SUPStep.CTFSS_POPULATE, True)
             self._report_progress("CTFSS buffer populated with {} parameters".format(
@@ -366,19 +354,15 @@ class SUPOperator(HIOCOperator):
     def _write_hsup_challenge_data(self, ctr: int, flg: int, msg: int, value: int, seq: int):
         """Write challenge data to HSUPIn nodes with guaranteed SEQ written last"""
         try:
-            # Build HSUP node paths
-            ctr_path = ['HSUPIn', self.config.fid, 'CTF', 'CTR']
-            flg_path = ['HSUPIn', self.config.fid, 'CTF', 'FLG']
-            msg_path = ['HSUPIn', self.config.fid, 'CTF', 'MSG']
-            value_path = ['HSUPIn', self.config.fid, 'CTF', 'VALUE']
-            seq_path = ['HSUPIn', self.config.fid, 'CTF', 'SEQ']
+            # Get objects node
+            objects = self.client.get_objects_node()
             
-            # Get nodes
-            ctr_node = self.client.get_node("ns=2;s=" + ".".join(ctr_path))
-            flg_node = self.client.get_node("ns=2;s=" + ".".join(flg_path))
-            msg_node = self.client.get_node("ns=2;s=" + ".".join(msg_path))
-            value_node = self.client.get_node("ns=2;s=" + ".".join(value_path))
-            seq_node = self.client.get_node("ns=2;s=" + ".".join(seq_path))
+            # Get HSUP nodes using proper browse paths
+            ctr_node = objects.get_child(["1:HSUPIn", "1:{}".format(self.config.fid), "1:CTF", "1:CTR"])
+            flg_node = objects.get_child(["1:HSUPIn", "1:{}".format(self.config.fid), "1:CTF", "1:FLG"])
+            msg_node = objects.get_child(["1:HSUPIn", "1:{}".format(self.config.fid), "1:CTF", "1:MSG"])
+            value_node = objects.get_child(["1:HSUPIn", "1:{}".format(self.config.fid), "1:CTF", "1:VALUE"])
+            seq_node = objects.get_child(["1:HSUPIn", "1:{}".format(self.config.fid), "1:CTF", "1:SEQ"])
             
             # Write all fields EXCEPT SEQ first
             ctr_node.set_value(ua.Variant(int(ctr) & 0xFFFFFFFF, ua.VariantType.UInt32))
@@ -400,19 +384,15 @@ class SUPOperator(HIOCOperator):
     def _read_hsup_response_data(self) -> dict:
         """Read response data from HSUPOut nodes"""
         try:
-            # Build HSUP response node paths
-            ctr_path = ['HSUPOut', self.config.fid, 'FTC', 'CTR']
-            flg_path = ['HSUPOut', self.config.fid, 'FTC', 'FLG']
-            msg_path = ['HSUPOut', self.config.fid, 'FTC', 'MSG']
-            value_path = ['HSUPOut', self.config.fid, 'FTC', 'VALUE']
-            seq_path = ['HSUPOut', self.config.fid, 'FTC', 'SEQ']
+            # Get objects node
+            objects = self.client.get_objects_node()
             
-            # Get nodes and read values
-            ctr_node = self.client.get_node("ns=2;s=" + ".".join(ctr_path))
-            flg_node = self.client.get_node("ns=2;s=" + ".".join(flg_path))
-            msg_node = self.client.get_node("ns=2;s=" + ".".join(msg_path))
-            value_node = self.client.get_node("ns=2;s=" + ".".join(value_path))
-            seq_node = self.client.get_node("ns=2;s=" + ".".join(seq_path))
+            # Get HSUP response nodes using proper browse paths
+            ctr_node = objects.get_child(["1:HSUPOut", "1:{}".format(self.config.fid), "1:FTC", "1:CTR"])
+            flg_node = objects.get_child(["1:HSUPOut", "1:{}".format(self.config.fid), "1:FTC", "1:FLG"])
+            msg_node = objects.get_child(["1:HSUPOut", "1:{}".format(self.config.fid), "1:FTC", "1:MSG"])
+            value_node = objects.get_child(["1:HSUPOut", "1:{}".format(self.config.fid), "1:FTC", "1:VALUE"])
+            seq_node = objects.get_child(["1:HSUPOut", "1:{}".format(self.config.fid), "1:FTC", "1:SEQ"])
             
             return {
                 'CTR': ctr_node.get_value(),
@@ -622,9 +602,7 @@ class SUPOperator(HIOCOperator):
             self.abort_requested = False
             self.operation_history.clear()
             
-            # Step 0: Connect to server
-            if not self._connect_to_server():
-                return False
+            # Client already provided and validated - no connection step needed
             
             # Step 1: Check SUP capability
             if not self._check_sup_capability():
@@ -672,12 +650,6 @@ class SUPOperator(HIOCOperator):
             self._log_step(HIOCStep.ABORTED, False, error_message=str(e))
             self._report_progress("✗ SUP operation failed: {}".format(e))
             return False
-        finally:
-            if self.client:
-                try:
-                    self.client.disconnect()
-                except:
-                    pass
 
 
 # Example usage for GUI integration
@@ -687,9 +659,14 @@ def create_example_sup_operator():
     def progress_callback(message: str):
         print("Progress: {}".format(message))
     
+    # Note: In real usage, client would be provided from main_gui
+    from opcua import Client
+    client = Client("opc.tcp://localhost:4840")
+    # client.connect()  # Connection managed by main_gui
+    
     # Example configuration for SUP operation
     config = SUPOperationConfig(
-        server_url="opc.tcp://localhost:4840",
+        client=client,
         controller_id=1464099,  # CG1
         fid="F3",  # Must support SUP (FIDSize > 1)
         operation_type=HIOCOperationType.STRUCTURED_PARAMS,

@@ -23,7 +23,6 @@ class HIOCOperationType(Enum):
 
 class HIOCStep(Enum):
     """HIOC protocol steps"""
-    CONNECTING = "connecting"
     HTT_REQUEST = "htt_request"      # Auxiliary step for thresholds
     HTT_RESPONSE = "htt_response"    # Auxiliary step for thresholds
     STEP1_CHALLENGE = "step1_challenge"
@@ -53,10 +52,10 @@ class HIOCStepResult:
 
 class HIOCOperationConfig:
     """Configuration for HIOC operation"""
-    def __init__(self, server_url: str, controller_id: int, fid: str, 
+    def __init__(self, client: Client, controller_id: int, fid: str, 
                  operation_type: HIOCOperationType, threshold_value: Optional[int] = None,
                  timeout_seconds: float = 10.0, progress_callback: Optional[Callable[[str], None]] = None):
-        self.server_url = server_url
+        self.client = client
         self.controller_id = controller_id
         self.fid = fid  # F0-F5
         self.operation_type = operation_type
@@ -73,7 +72,7 @@ class HIOCOperator:
     
     def __init__(self, config: HIOCOperationConfig):
         self.config = config
-        self.client: Optional[Client] = None
+        self.client = config.client  # Use provided client directly
         self.operation_history: List[HIOCStepResult] = []
         self.current_sequence = 1
         self.last_response_sequence = 0
@@ -119,12 +118,17 @@ class HIOCOperator:
 
     def _validate_config(self):
         """Validate the operation configuration"""
+        if not self.config.client:
+            raise ValueError("Connected client is required")
+            
         if self.config.operation_type == HIOCOperationType.THRESHOLD:
             if not self.config.threshold_value or not (1 <= self.config.threshold_value <= 15):
                 raise ValueError("Threshold operations require threshold_value between 1-15")
         
-        if not self.config.fid or self.config.fid not in ['F0', 'F1', 'F2', 'F3', 'F4', 'F5']:
-            raise ValueError("FID must be one of F0-F5")
+        # Generate valid FID list F0-F31 for generic support
+        valid_fids = ['F{}'.format(i) for i in range(32)]
+        if not self.config.fid or self.config.fid not in valid_fids:
+            raise ValueError("FID must be one of F0-F31")
 
     def _report_progress(self, message: str):
         """Report progress to GUI callback"""
@@ -147,12 +151,12 @@ class HIOCOperator:
         
         # Report progress
         if success:
-            self._report_progress(f"✓ {step.value}: Success")
+            self._report_progress("✓ {}: Success".format(step.value))
         else:
             if timeout:
-                self._report_progress(f"✗ {step.value}: Timeout")
+                self._report_progress("✗ {}: Timeout".format(step.value))
             else:
-                self._report_progress(f"✗ {step.value}: {error_message or 'Failed'}")
+                self._report_progress("✗ {}: {}".format(step.value, error_message or 'Failed'))
 
     def _get_next_sequence(self) -> int:
         """Get next challenge sequence number (always odd)"""
@@ -166,37 +170,18 @@ class HIOCOperator:
         self.current_sequence = self._get_next_sequence()
         self.last_response_sequence = response_seq
 
-    def _connect_to_server(self) -> bool:
-        """Connect to OPC-UA server"""
-        try:
-            self._report_progress(f"Connecting to {self.config.server_url}...")
-            self.client = Client(self.config.server_url)
-            self.client.connect()
-            
-            self._log_step(HIOCStep.CONNECTING, True)
-            self._report_progress("Connected to server successfully")
-            return True
-            
-        except Exception as e:
-            self._log_step(HIOCStep.CONNECTING, False, error_message=str(e))
-            return False
-
     def _write_challenge_data(self, ctr: int, flg: int, msg: int, value: int, seq: int):
         """Write challenge data to HIOCIn nodes with guaranteed SEQ field written last"""
         try:
-            # Build node paths
-            ctr_path = ['HIOCIn', self.config.fid, 'STF', 'CTR']
-            flg_path = ['HIOCIn', self.config.fid, 'STF', 'FLG']
-            msg_path = ['HIOCIn', self.config.fid, 'STF', 'MSG']
-            value_path = ['HIOCIn', self.config.fid, 'STF', 'VALUE']
-            seq_path = ['HIOCIn', self.config.fid, 'STF', 'SEQ']
+            # Get objects node
+            objects = self.client.get_objects_node()
             
-            # Get nodes
-            ctr_node = self.client.get_node("ns=2;s=" + ".".join(ctr_path))
-            flg_node = self.client.get_node("ns=2;s=" + ".".join(flg_path))
-            msg_node = self.client.get_node("ns=2;s=" + ".".join(msg_path))
-            value_node = self.client.get_node("ns=2;s=" + ".".join(value_path))
-            seq_node = self.client.get_node("ns=2;s=" + ".".join(seq_path))
+            # Get nodes using proper browse paths
+            ctr_node = objects.get_child(["1:HIOCIn", "1:{}".format(self.config.fid), "1:STF", "1:CTR"])
+            flg_node = objects.get_child(["1:HIOCIn", "1:{}".format(self.config.fid), "1:STF", "1:FLG"])
+            msg_node = objects.get_child(["1:HIOCIn", "1:{}".format(self.config.fid), "1:STF", "1:MSG"])
+            value_node = objects.get_child(["1:HIOCIn", "1:{}".format(self.config.fid), "1:STF", "1:VALUE"])
+            seq_node = objects.get_child(["1:HIOCIn", "1:{}".format(self.config.fid), "1:STF", "1:SEQ"])
             
             # Write all fields EXCEPT SEQ first (guaranteed ordering)
             ctr_node.set_value(ua.Variant(int(ctr) & 0xFFFFFFFF, ua.VariantType.UInt32))
@@ -219,19 +204,15 @@ class HIOCOperator:
     def _read_response_data(self) -> Dict[str, Any]:
         """Read response data from HIOCOut nodes"""
         try:
-            # Build node paths
-            ctr_path = ['HIOCOut', self.config.fid, 'FTS', 'CTR']
-            flg_path = ['HIOCOut', self.config.fid, 'FTS', 'FLG']
-            msg_path = ['HIOCOut', self.config.fid, 'FTS', 'MSG']
-            value_path = ['HIOCOut', self.config.fid, 'FTS', 'VALUE']
-            seq_path = ['HIOCOut', self.config.fid, 'FTS', 'SEQ']
+            # Get objects node
+            objects = self.client.get_objects_node()
             
-            # Get nodes and read values
-            ctr_node = self.client.get_node("ns=2;s=" + ".".join(ctr_path))
-            flg_node = self.client.get_node("ns=2;s=" + ".".join(flg_path))
-            msg_node = self.client.get_node("ns=2;s=" + ".".join(msg_path))
-            value_node = self.client.get_node("ns=2;s=" + ".".join(value_path))
-            seq_node = self.client.get_node("ns=2;s=" + ".".join(seq_path))
+            # Get nodes and read values using proper browse paths
+            ctr_node = objects.get_child(["1:HIOCOut", "1:{}".format(self.config.fid), "1:FTS", "1:CTR"])
+            flg_node = objects.get_child(["1:HIOCOut", "1:{}".format(self.config.fid), "1:FTS", "1:FLG"])
+            msg_node = objects.get_child(["1:HIOCOut", "1:{}".format(self.config.fid), "1:FTS", "1:MSG"])
+            value_node = objects.get_child(["1:HIOCOut", "1:{}".format(self.config.fid), "1:FTS", "1:VALUE"])
+            seq_node = objects.get_child(["1:HIOCOut", "1:{}".format(self.config.fid), "1:FTS", "1:SEQ"])
             
             return {
                 'CTR': ctr_node.get_value(),
@@ -371,7 +352,7 @@ class HIOCOperator:
                             9000000: "Controller abort",
                             9100000: "User abort", 
                             9300000: "Timeout abort"
-                        }.get(response_data['MSG'], f"Unknown abort: {response_data['MSG']}")
+                        }.get(response_data['MSG'], "Unknown abort: {}".format(response_data['MSG']))
                         
                         self._log_step(response_step, False, response_data=response_data, 
                                      error_message=abort_msg)
@@ -395,9 +376,7 @@ class HIOCOperator:
             self.abort_requested = False
             self.operation_history.clear()
             
-            # Step 0: Connect to server
-            if not self._connect_to_server():
-                return False
+            # Client already provided and validated - no connection step needed
             
             # Auxiliary Step: HTT request for threshold operations
             if self.config.operation_type == HIOCOperationType.THRESHOLD:
@@ -439,12 +418,6 @@ class HIOCOperator:
             self._log_step(HIOCStep.ABORTED, False, error_message=str(e))
             self._report_progress("✗ Operation failed: {}".format(e))
             return False
-        finally:
-            if self.client:
-                try:
-                    self.client.disconnect()
-                except:
-                    pass
 
     def execute_operation_async(self, completion_callback: Optional[Callable[[bool], None]] = None):
         """Execute operation in background thread"""
@@ -467,12 +440,11 @@ class HIOCOperator:
             return "No operation history available"
         
         trace_lines = []
-        trace_lines.append(f"HIOC Operation Trace - {self.config.operation_type.value}")
-        trace_lines.append(f"Server: {self.config.server_url}")
-        trace_lines.append(f"Controller: {self.config.controller_id}")
-        trace_lines.append(f"FID: {self.config.fid}")
+        trace_lines.append("HIOC Operation Trace - {}".format(self.config.operation_type.value))
+        trace_lines.append("Controller: {}".format(self.config.controller_id))
+        trace_lines.append("FID: {}".format(self.config.fid))
         if self.config.threshold_value:
-            trace_lines.append(f"Threshold: TH{self.config.threshold_value}")
+            trace_lines.append("Threshold: TH{}".format(self.config.threshold_value))
         trace_lines.append("-" * 60)
         
         for i, step in enumerate(self.operation_history, 1):
@@ -552,11 +524,16 @@ def create_example_hioc_operator():
     """Example of how to create and use HIOCOperator"""
     
     def progress_callback(message: str):
-        print(f"Progress: {message}")
+        print("Progress: {}".format(message))
+    
+    # Note: In real usage, client would be provided from main_gui
+    from opcua import Client
+    client = Client("opc.tcp://localhost:4840")
+    # client.connect()  # Connection managed by main_gui
     
     # Example configuration for threshold operation
     config = HIOCOperationConfig(
-        server_url="opc.tcp://localhost:4840",
+        client=client,
         controller_id=1464099,  # CG1
         fid="F2",
         operation_type=HIOCOperationType.THRESHOLD,

@@ -34,7 +34,7 @@ class MainGUI:
         self.root.title("ITER OPC-UA Control System - COS/PSOS/IOP/HIOC")
         self.root.geometry("1400x900")
         
-        # Server configurations
+        # Server configurations with ServerConnection objects
         self.servers = {
             'CG1': ServerConnection(
                 name='CG1',
