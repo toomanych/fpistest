@@ -1,7 +1,8 @@
 """
 HIOC Module
-Contains HIOCOperator, SUPOperator, HIOCSUPValidator and HIOC Dialog for GUI integration.
+Contains HIOCOperator, HIOCwSUPOperator, SUPOperator, HIOCSUPValidator and HIOC Dialog for GUI integration.
 Complete implementation with all required widgets and functionality.
+UPDATED: Clean integration with new SUP implementation.
 """
 
 import tkinter as tk
@@ -18,6 +19,7 @@ logger = logging.getLogger(__name__)
 # Import our operator classes
 from hioc_operator import HIOCOperator, HIOCOperationConfig, HIOCOperationType, HIOCStep
 from sup_operator import SUPOperator, SUPOperationConfig
+from hiocwsup_operator import HIOCwSUPOperator  
 from hioc_sup_validator import HIOCSUPValidator, ValidationResult
 
 
@@ -464,10 +466,16 @@ class HIOCDialog:
                 self.parsed_fidsize = fidsize
                 self.parsed_parameters = parameters
                 
+                # Enhanced status display
                 self.file_status_label.config(
-                    text="✓ Valid: FIDSize={}, {} parameters".format(fidsize, len(parameters)), 
+                    text="✓ Valid: FIDSize={}, {} parameters parsed for HIOCwSUP".format(
+                        fidsize, len(parameters)), 
                     foreground="green"
                 )
+                
+                # Log parameter data for debugging
+                self.log_parameter_data_summary()
+                
             except Exception as e:
                 self.file_status_label.config(
                     text="✗ Error: {}".format(str(e)), 
@@ -476,6 +484,9 @@ class HIOCDialog:
                 self.selected_file_path = None
                 self.parsed_fidsize = None
                 self.parsed_parameters = None
+                
+                # Log parsing error
+                self.log_message("CSV parsing failed: {}".format(str(e)))
 
     def validate_parameter_file(self, file_path: str) -> Tuple[int, List[int]]:
         """Validate parameter CSV file and return FIDSize and parameter list"""
@@ -512,7 +523,31 @@ class HIOCDialog:
         if len(parameters) > 511:
             raise ValueError("Too many parameters: {} (max 511)".format(len(parameters)))
         
+        # Add validation message for SUPOperator compatibility
+        self.log_message("✓ Parsed CSV: FIDSize={}, {} parameters ready for HIOCwSUP".format(
+            fidsize, len(parameters)))
+        
         return fidsize, parameters
+
+    def is_parameter_data_ready(self) -> bool:
+        """Check if parameter data is ready for SUP operation"""
+        return (self.parsed_fidsize is not None and 
+                self.parsed_parameters is not None and 
+                len(self.parsed_parameters) > 0)
+
+    def log_parameter_data_summary(self):
+        """Log summary of current parameter data for debugging"""
+        if self.is_parameter_data_ready():
+            self.log_message("Parameter Data Summary:")
+            self.log_message("  FIDSize: {}".format(self.parsed_fidsize))
+            self.log_message("  Parameter count: {}".format(len(self.parsed_parameters)))
+            self.log_message("  First 3 parameters: {}".format(
+                [hex(p) for p in self.parsed_parameters[:3]]))
+            if len(self.parsed_parameters) > 3:
+                self.log_message("  Last 3 parameters: {}".format(
+                    [hex(p) for p in self.parsed_parameters[-3:]]))
+        else:
+            self.log_message("No parameter data available")
 
     def log_message(self, message: str):
         """Add message to log"""
@@ -541,10 +576,24 @@ class HIOCDialog:
             messagebox.showwarning("Operation in Progress", "Another operation is already in progress.")
             return
         
-        # Validate operation requirements
-        if operation == "parameter_set" and not self.selected_file_path:
-            messagebox.showerror("File Required", "Please select a parameter file for parameter set operations.")
-            return
+        # Enhanced validation for parameter set operations
+        if operation == "parameter_set":
+            if not self.selected_file_path:
+                messagebox.showerror("File Required", "Please select a parameter file for parameter set operations.")
+                return
+            
+            if not self.is_parameter_data_ready():
+                messagebox.showerror("Data Not Ready", 
+                                   "Parameter data not properly parsed. Please reselect the CSV file.")
+                return
+            
+            # Log HIOCwSUP operation details
+            self.log_message("Starting HIOCwSUP operation:")
+            self.log_message("  Server: {}".format(server))
+            self.log_message("  FID: {}".format(fid))
+            self.log_message("  FIDSize: {}".format(self.parsed_fidsize))
+            self.log_message("  Parameters: {} values".format(len(self.parsed_parameters)))
+            self.log_message("  Flow: Nonce → CRC32 → HIOC Unlock → CTFSS → HSUP")
         
         # Start operation synchronously
         self.operation_in_progress = True
@@ -570,7 +619,7 @@ class HIOCDialog:
                 self.request_htt_and_show_threshold_selection(server, fid)
                 return
             elif operation == "parameter_set":
-                # Use SUPOperator
+                # Use new clean SUP operation flow
                 self.execute_sup_operation(server, fid)
             else:
                 # Use HIOCOperator for other operations
@@ -579,6 +628,103 @@ class HIOCDialog:
         except Exception as e:
             self.update_progress("Error: {}".format(e))
             self.operation_in_progress = False
+
+    def execute_sup_operation(self, server: str, fid: str):
+        """Execute SUP operation using the clean 3-step flow"""
+        server_info = self.servers[server]
+        
+        # Validate connection
+        if not server_info.connected or not server_info.client:
+            self.update_progress("{} not connected".format(server))
+            self.operation_in_progress = False
+            return
+        
+        # Validate parsed parameter data is available
+        if self.parsed_fidsize is None or self.parsed_parameters is None:
+            self.update_progress("Parameter file not properly parsed")
+            self.operation_in_progress = False
+            return
+        
+        try:
+            # Step 1: Request nonce using SUPOperator
+            self.update_progress("Step 1: Requesting nonce...")
+            
+            sup_config_nonce = SUPOperationConfig(
+                client=server_info.client,
+                controller_id=server_info.controller_id,
+                fid=fid,
+                parameters=self.parsed_parameters,
+                progress_callback=self.update_progress
+            )
+            
+            sup_operator_nonce = SUPOperator(sup_config_nonce)
+            nonce_success = sup_operator_nonce.request_nonce()
+            
+            if not nonce_success:
+                self.update_progress("✗ Nonce request failed")
+                self.log_message(sup_operator_nonce.get_abort_analysis())
+                self.operation_in_progress = False
+                return
+            
+            # Step 2: Calculate CRC32
+            self.update_progress("Step 2: Calculating CRC32...")
+            crc32_success = sup_operator_nonce.calculate_crc32()
+            
+            if not crc32_success:
+                self.update_progress("✗ CRC32 calculation failed")
+                self.operation_in_progress = False
+                return
+            
+            crc32_value = sup_operator_nonce.crc32_value
+            
+            # Step 3: HIOC unlock using HIOCwSUPOperator
+            self.update_progress("Step 3: HIOC unlock sequence...")
+            
+            hioc_config = HIOCOperationConfig(
+                client=server_info.client,
+                controller_id=server_info.controller_id,
+                fid=fid,
+                operation_type=HIOCOperationType.THRESHOLD,  # Placeholder type
+                threshold_command_code=50,  # Unlock command
+                threshold_value=crc32_value,
+                progress_callback=self.update_progress
+            )
+            
+            hiocwsup_operator = HIOCwSUPOperator(hioc_config)
+            unlock_success = hiocwsup_operator.perform_unlock_sequence(crc32_value)
+            
+            if not unlock_success:
+                self.update_progress("✗ HIOC unlock failed")
+                self.log_message(hiocwsup_operator.get_abort_analysis())
+                self.operation_in_progress = False
+                return
+            
+            # Step 4: SUP operation (CTFSS + HSUP)
+            self.update_progress("Step 4: SUP sequence...")
+            
+            sup_config_final = SUPOperationConfig(
+                client=server_info.client,
+                controller_id=server_info.controller_id,
+                fid=fid,
+                parameters=self.parsed_parameters,
+                nonce=sup_operator_nonce.nonce_value,
+                progress_callback=self.update_progress
+            )
+            
+            sup_operator_final = SUPOperator(sup_config_final)
+            sup_success = sup_operator_final.execute_operation()
+            
+            # Show results
+            if sup_success:
+                self.update_progress("✓ HIOCwSUP operation completed successfully")
+            else:
+                self.update_progress("✗ SUP operation failed")
+                self.log_message(sup_operator_final.get_abort_analysis())
+            
+        except Exception as e:
+            self.update_progress("✗ HIOCwSUP operation error: {}".format(e))
+        
+        self.operation_in_progress = False
 
     def execute_dual_operation(self, fid: str, operation: str):
         """Execute operation on both CG1 and CG2"""
@@ -622,6 +768,128 @@ class HIOCDialog:
         except Exception as e:
             self.update_progress("Dual operation error: {}".format(e))
             self.operation_in_progress = False
+
+    def execute_dual_sup_operation(self, fid: str):
+        """Execute SUP operation on both CG1 and CG2 (CG1 first, then CG2 if CG1 succeeds)"""
+        try:
+            # Execute on CG1 first
+            self.update_progress("Starting CG1 HIOCwSUP operation...")
+            
+            cg1_success = self.execute_single_sup_operation_sync('CG1', fid)
+            
+            if cg1_success:
+                self.update_progress("✓ CG1 HIOCwSUP completed - Starting CG2 HIOCwSUP operation...")
+                
+                # Execute on CG2 automatically since CG1 succeeded
+                cg2_success = self.execute_single_sup_operation_sync('CG2', fid)
+                
+                if cg2_success:
+                    self.update_progress("✓ Both CG1 and CG2 HIOCwSUP operations completed successfully")
+                else:
+                    self.update_progress("✗ CG2 HIOCwSUP operation failed")
+            else:
+                self.update_progress("✗ CG1 HIOCwSUP operation failed - CG2 operation cancelled")
+                
+        except Exception as e:
+            self.update_progress("Dual HIOCwSUP operation error: {}".format(e))
+            
+        self.operation_in_progress = False
+
+    def execute_single_sup_operation_sync(self, server: str, fid: str) -> bool:
+        """Execute SUP operation synchronously and return success status"""
+        server_info = self.servers[server]
+        
+        # Validate connection
+        if not server_info.connected or not server_info.client:
+            self.update_progress("{}: Not connected".format(server))
+            return False
+        
+        # Validate parsed parameter data is available
+        if self.parsed_fidsize is None or self.parsed_parameters is None:
+            self.update_progress("{}: Parameter data not available".format(server))
+            return False
+        
+        try:
+            # Step 1: Request nonce using SUPOperator
+            self.update_progress("{}: Requesting nonce...".format(server))
+            
+            sup_config_nonce = SUPOperationConfig(
+                client=server_info.client,
+                controller_id=server_info.controller_id,
+                fid=fid,
+                parameters=self.parsed_parameters,
+                progress_callback=lambda msg: self.update_progress("{}: {}".format(server, msg))
+            )
+            
+            sup_operator_nonce = SUPOperator(sup_config_nonce)
+            nonce_success = sup_operator_nonce.request_nonce()
+            
+            if not nonce_success:
+                self.update_progress("{}: Nonce request failed".format(server))
+                self.log_message("--- {} NONCE ABORT ANALYSIS ---".format(server))
+                self.log_message(sup_operator_nonce.get_abort_analysis())
+                return False
+            
+            # Step 2: Calculate CRC32
+            self.update_progress("{}: Calculating CRC32...".format(server))
+            crc32_success = sup_operator_nonce.calculate_crc32()
+            
+            if not crc32_success:
+                self.update_progress("{}: CRC32 calculation failed".format(server))
+                return False
+            
+            crc32_value = sup_operator_nonce.crc32_value
+            
+            # Step 3: HIOC unlock using HIOCwSUPOperator
+            self.update_progress("{}: HIOC unlock sequence...".format(server))
+            
+            hioc_config = HIOCOperationConfig(
+                client=server_info.client,
+                controller_id=server_info.controller_id,
+                fid=fid,
+                operation_type=HIOCOperationType.THRESHOLD,  # Placeholder type
+                threshold_command_code=50,  # Unlock command
+                threshold_value=crc32_value,
+                progress_callback=lambda msg: self.update_progress("{}: {}".format(server, msg))
+            )
+            
+            hiocwsup_operator = HIOCwSUPOperator(hioc_config)
+            unlock_success = hiocwsup_operator.perform_unlock_sequence(crc32_value)
+            
+            if not unlock_success:
+                self.update_progress("{}: HIOC unlock failed".format(server))
+                self.log_message("--- {} HIOC UNLOCK ABORT ANALYSIS ---".format(server))
+                self.log_message(hiocwsup_operator.get_abort_analysis())
+                return False
+            
+            # Step 4: SUP operation (CTFSS + HSUP)
+            self.update_progress("{}: SUP sequence...".format(server))
+            
+            sup_config_final = SUPOperationConfig(
+                client=server_info.client,
+                controller_id=server_info.controller_id,
+                fid=fid,
+                parameters=self.parsed_parameters,
+                nonce=sup_operator_nonce.nonce_value,
+                progress_callback=lambda msg: self.update_progress("{}: {}".format(server, msg))
+            )
+            
+            sup_operator_final = SUPOperator(sup_config_final)
+            sup_success = sup_operator_final.execute_operation()
+            
+            # Show results
+            if sup_success:
+                self.update_progress("✓ {} HIOCwSUP operation completed successfully".format(server))
+                return True
+            else:
+                self.update_progress("✗ {} SUP operation failed".format(server))
+                self.log_message("--- {} SUP ABORT ANALYSIS ---".format(server))
+                self.log_message(sup_operator_final.get_abort_analysis())
+                return False
+            
+        except Exception as e:
+            self.update_progress("✗ {} HIOCwSUP operation error: {}".format(server, e))
+            return False
 
     def request_htt_and_show_threshold_selection(self, server: str, fid: str):
         """Request HTT values using HIOCOperator and show threshold selection"""
@@ -982,96 +1250,29 @@ class HIOCDialog:
         
         self.operation_in_progress = False
 
-    def execute_sup_operation(self, server: str, fid: str):
-        """Execute SUP operation using SUPOperator"""
-        server_info = self.servers[server]
-        
-        # Validate connection
-        if not server_info.connected or not server_info.client:
-            self.update_progress("{} not connected".format(server))
-            self.operation_in_progress = False
-            return
-        
-        # Validate parsed parameter data is available
-        if self.parsed_fidsize is None or self.parsed_parameters is None:
-            self.update_progress("Parameter file not properly parsed")
-            self.operation_in_progress = False
-            return
-        
-        # Create SUPOperator configuration with parsed data
-        config = SUPOperationConfig(
-            client=server_info.client,  # Use existing connection
-            controller_id=server_info.controller_id,
-            fid=fid,
-            operation_type=HIOCOperationType.STRUCTURED_PARAMS,
-            fidsize=self.parsed_fidsize,
-            parameters=self.parsed_parameters,
-            progress_callback=self.update_progress
-        )
-        
-        # Execute operation
-        operator = SUPOperator(config)
-        success = operator.execute_operation()
-        
-        # Show results
-        if success:
-            self.update_progress("✓ SUP operation completed successfully")
-        else:
-            self.update_progress("✗ SUP operation failed")
-            abort_analysis = operator.get_abort_analysis()
-            self.log_message(abort_analysis)
-        
-        self.operation_in_progress = False
-
     def execute_dual_hioc_operation(self, fid: str, operation: str):
         """Execute HIOC operation on both CG1 and CG2 (CG1 first, then CG2 if CG1 succeeds)"""
         try:
             # Execute on CG1 first
-            self.dialog.after(0, self.update_progress, "Starting CG1 operation...")
+            self.update_progress("Starting CG1 operation...")
             
             cg1_success = self.execute_single_hioc_operation_sync('CG1', fid, operation)
             
             if cg1_success:
-                self.dialog.after(0, self.update_progress, "✓ CG1 completed - Starting CG2 operation...")
+                self.update_progress("✓ CG1 completed - Starting CG2 operation...")
                 
                 # Execute on CG2 automatically since CG1 succeeded
                 cg2_success = self.execute_single_hioc_operation_sync('CG2', fid, operation)
                 
                 if cg2_success:
-                    self.dialog.after(0, self.update_progress, "✓ Both CG1 and CG2 operations completed successfully")
+                    self.update_progress("✓ Both CG1 and CG2 operations completed successfully")
                 else:
-                    self.dialog.after(0, self.update_progress, "✗ CG2 operation failed")
+                    self.update_progress("✗ CG2 operation failed")
             else:
-                self.dialog.after(0, self.update_progress, "✗ CG1 operation failed - CG2 operation cancelled")
+                self.update_progress("✗ CG1 operation failed - CG2 operation cancelled")
                 
         except Exception as e:
-            self.dialog.after(0, self.update_progress, "Dual HIOC operation error: {}".format(e))
-            
-        self.operation_in_progress = False
-
-    def execute_dual_sup_operation(self, fid: str):
-        """Execute SUP operation on both CG1 and CG2 (CG1 first, then CG2 if CG1 succeeds)"""
-        try:
-            # Execute on CG1 first
-            self.dialog.after(0, self.update_progress, "Starting CG1 SUP operation...")
-            
-            cg1_success = self.execute_single_sup_operation_sync('CG1', fid)
-            
-            if cg1_success:
-                self.dialog.after(0, self.update_progress, "✓ CG1 SUP completed - Starting CG2 SUP operation...")
-                
-                # Execute on CG2 automatically since CG1 succeeded
-                cg2_success = self.execute_single_sup_operation_sync('CG2', fid)
-                
-                if cg2_success:
-                    self.dialog.after(0, self.update_progress, "✓ Both CG1 and CG2 SUP operations completed successfully")
-                else:
-                    self.dialog.after(0, self.update_progress, "✗ CG2 SUP operation failed")
-            else:
-                self.dialog.after(0, self.update_progress, "✗ CG1 SUP operation failed - CG2 operation cancelled")
-                
-        except Exception as e:
-            self.dialog.after(0, self.update_progress, "Dual SUP operation error: {}".format(e))
+            self.update_progress("Dual HIOC operation error: {}".format(e))
             
         self.operation_in_progress = False
 
@@ -1118,102 +1319,6 @@ class HIOCDialog:
             abort_analysis = operator.get_abort_analysis()
             self.log_message("--- {} ABORT ANALYSIS ---".format(server))
             self.log_message(abort_analysis)
-        
-        return success
-
-    def execute_single_sup_operation_sync(self, server: str, fid: str) -> bool:
-        """Execute SUP operation synchronously and return success status"""
-        server_info = self.servers[server]
-        
-        # Validate connection
-        if not server_info.connected or not server_info.client:
-            self.update_progress("{}: Not connected".format(server))
-            return False
-        
-        # Create SUPOperator configuration with connected client
-        config = SUPOperationConfig(
-            client=server_info.client,  # Use existing connection
-            controller_id=server_info.controller_id,
-            fid=fid,
-            operation_type=HIOCOperationType.STRUCTURED_PARAMS,
-            csv_file_path=self.selected_file_path,
-            progress_callback=lambda msg: self.update_progress("{}: {}".format(server, msg))
-        )
-        
-        # Execute operation
-        operator = SUPOperator(config)
-        success = operator.execute_operation()
-        
-        # Show results
-        if success:
-            self.update_progress("✓ {} SUP operation completed successfully".format(server))
-        else:
-            self.update_progress("✗ {} SUP operation failed".format(server))
-            abort_analysis = operator.get_abort_analysis()
-            self.log_message("--- {} SUP ABORT ANALYSIS ---".format(server))
-            self.log_message(abort_analysis)
-        
-        hioc_operation=operation_mapping.get(operation)
-        if not hioc_operation:
-            self.dialog.after(0, self.update_progress, "{}: Invalid HIOC operation: {}".format(
-                server, operation))
-            return False
-        
-        # Create HIOCOperator configuration with connected client
-        config = HIOCOperationConfig(
-            client=server_info.client,  # Use existing connection
-            controller_id=server_info.controller_id,
-            fid=fid,
-            operation_type=hioc_operation,
-            progress_callback=lambda msg: self.dialog.after(0, self.update_progress, "{}: {}".format(server, msg))
-        )
-        
-        # Execute operation
-        operator = HIOCOperator(config)
-        success = operator.execute_operation()
-        
-        # Show results
-        if success:
-            self.dialog.after(0, self.update_progress, "✓ {} operation completed successfully".format(server))
-        else:
-            self.dialog.after(0, self.update_progress, "✗ {} operation failed".format(server))
-            abort_analysis = operator.get_abort_analysis()
-            self.dialog.after(0, self.log_message, "--- {} ABORT ANALYSIS ---".format(server))
-            self.dialog.after(0, self.log_message, abort_analysis)
-        
-        return success
-
-    def execute_single_sup_operation_sync(self, server: str, fid: str) -> bool:
-        """Execute SUP operation synchronously and return success status"""
-        server_info = self.servers[server]
-        
-        # Validate connection
-        if not server_info.connected or not server_info.client:
-            self.dialog.after(0, self.update_progress, "{}: Not connected".format(server))
-            return False
-        
-        # Create SUPOperator configuration with connected client
-        config = SUPOperationConfig(
-            client=server_info.client,  # Use existing connection
-            controller_id=server_info.controller_id,
-            fid=fid,
-            operation_type=HIOCOperationType.STRUCTURED_PARAMS,
-            csv_file_path=self.selected_file_path,
-            progress_callback=lambda msg: self.dialog.after(0, self.update_progress, "{}: {}".format(server, msg))
-        )
-        
-        # Execute operation
-        operator = SUPOperator(config)
-        success = operator.execute_operation()
-        
-        # Show results
-        if success:
-            self.dialog.after(0, self.update_progress, "✓ {} SUP operation completed successfully".format(server))
-        else:
-            self.dialog.after(0, self.update_progress, "✗ {} SUP operation failed".format(server))
-            abort_analysis = operator.get_abort_analysis()
-            self.dialog.after(0, self.log_message, "--- {} SUP ABORT ANALYSIS ---".format(server))
-            self.dialog.after(0, self.log_message, abort_analysis)
         
         return success
 
