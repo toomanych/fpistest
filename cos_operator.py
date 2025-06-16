@@ -5,7 +5,6 @@ Simple, lightweight, synchronous operations for GUI integration.
 """
 
 from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass
 from enum import Enum
 from opcua import Client
 import logging
@@ -24,12 +23,18 @@ class COSCommand(Enum):
     POST_CHECK = (7, 'PostCheck')
     
     def __init__(self, value: int, description: str):
-        self.value = value
+        # Note: self.value is automatically set by Enum to the entire tuple
+        # We only need to set additional attributes
         self.description = description
+    
+    @property
+    def int_value(self):
+        """Get the integer command value (first element of the tuple)"""
+        return self.value[0]
 
 
 class COSState(Enum):
-    """COS_OPSTATE values with display colors"""
+    """COS_OPSTATE values with display colors (pure COS states only)"""
     OFF = (1, 'OFF', '#800080')                    # Purple
     NOT_READY = (2, 'NOT_READY', '#0000FF')        # Blue
     READY = (3, 'READY', '#FFA500')                # Orange
@@ -41,9 +46,15 @@ class COSState(Enum):
     LOCAL = (11, 'LOCAL', '#0000FF')               # Blue
     
     def __init__(self, value: int, name: str, color: str):
-        self.value = value
+        # Note: self.value is automatically set by Enum to the entire tuple
+        # We only need to set additional attributes
         self.state_name = name
         self.color = color
+    
+    @property
+    def int_value(self):
+        """Get the integer state value (first element of the tuple)"""
+        return self.value[0]
 
 
 class PSOSState(Enum):
@@ -64,36 +75,44 @@ class PSOSState(Enum):
     PLANT_ABORT_92 = (14, 'PLANT_ABORT_92')
     
     def __init__(self, value: int, name: str):
-        self.value = value
+        # Note: self.value is automatically set by Enum to the entire tuple
+        # We only need to set additional attributes
         self.state_name = name
+    
+    @property
+    def int_value(self):
+        """Get the integer state value (first element of the tuple)"""
+        return self.value[0]
 
 
-@dataclass
 class ServerConfig:
     """Configuration for a single server"""
-    name: str
-    url: str
-    client: Optional[Client] = None
-    connected: bool = False
+    def __init__(self, name: str, url: str, client: Optional[Client] = None, connected: bool = False):
+        self.name = name
+        self.url = url
+        self.client = client
+        self.connected = connected
 
 
-@dataclass
 class SystemState:
     """Current state of a system"""
-    server_name: str
-    connected: bool
-    cos_state: Optional[COSState] = None
-    psos_state: Optional[PSOSState] = None
-    cos_raw_value: Optional[int] = None
-    psos_raw_value: Optional[int] = None
+    def __init__(self, server_name: str, connected: bool, cos_state: Optional[COSState] = None, 
+                 psos_state: Optional[PSOSState] = None, cos_raw_value: Optional[int] = None, 
+                 psos_raw_value: Optional[int] = None):
+        self.server_name = server_name
+        self.connected = connected
+        self.cos_state = cos_state
+        self.psos_state = psos_state
+        self.cos_raw_value = cos_raw_value
+        self.psos_raw_value = psos_raw_value
 
 
-@dataclass
 class CommandResult:
     """Result of a COS command operation"""
-    success: bool
-    server_results: Dict[str, bool]  # server_name -> success
-    error_message: Optional[str] = None
+    def __init__(self, success: bool, server_results: Dict[str, bool], error_message: Optional[str] = None):
+        self.success = success
+        self.server_results = server_results
+        self.error_message = error_message
 
 
 class COSOperator:
@@ -106,9 +125,10 @@ class COSOperator:
         self.servers: Dict[str, ServerConfig] = {}
         
         # Create lookup dictionaries for states
-        self.cos_states_by_value = {state.value: state for state in COSState}
-        self.psos_states_by_value = {state.value: state for state in PSOSState}
-        self.commands_by_value = {cmd.value: cmd for cmd in COSCommand}
+        # Use int_value property to get just the integer part from the tuple value
+        self.cos_states_by_value = {state.int_value: state for state in COSState.__members__.values()}
+        self.psos_states_by_value = {state.int_value: state for state in PSOSState.__members__.values()}
+        self.commands_by_value = {cmd.int_value: cmd for cmd in COSCommand.__members__.values()}
 
     def add_server(self, name: str, url: str) -> bool:
         """Add a server configuration"""

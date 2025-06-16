@@ -116,7 +116,7 @@ class MainGUI:
         
         for i, (server_name, server_info) in enumerate(self.servers.items()):
             # Server name
-            ttk.Label(conn_frame, text=f"{server_name}:", 
+            ttk.Label(conn_frame, text="{}:".format(server_name), 
                      font=('TkDefaultFont', 10, 'bold')).grid(
                 row=i, column=0, sticky=tk.W, padx=(0, 10))
             
@@ -159,7 +159,7 @@ class MainGUI:
         for command, row, col in commands:
             btn = ttk.Button(
                 cos_frame, 
-                text=f"{command.description}\n({command.value})",
+                text="{}\n({})".format(command.description, command.value),
                 command=lambda cmd=command: self.send_cos_command_dialog(cmd),
                 width=15
             )
@@ -172,7 +172,7 @@ class MainGUI:
         for i, (value, description) in enumerate(self.iop_commands.items()):
             btn = ttk.Button(
                 iop_frame,
-                text=f"{description}\n({value})",
+                text="{}\n({})".format(description, value),
                 command=lambda v=value: self.send_iop_command(v),
                 width=15
             )
@@ -205,7 +205,7 @@ class MainGUI:
 
     def create_server_status_frame(self, parent, server_name: str, column: int):
         """Create status frame for individual server"""
-        server_frame = ttk.LabelFrame(parent, text=f"{server_name} Status", padding="10")
+        server_frame = ttk.LabelFrame(parent, text="{} Status".format(server_name), padding="10")
         server_frame.grid(row=0, column=column, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5)
         
         self.server_status_frames[server_name] = server_frame
@@ -285,7 +285,7 @@ class MainGUI:
             if server_name in ['CG1', 'CG2']:
                 self.cos_operator.connect_server(server_name)
             
-            logger.info(f"Connected to {server_name}")
+            logger.info("Connected to {}".format(server_name))
             
         except Exception as e:
             logger.error("Failed to connect to {}: {}".format(server_name, e))

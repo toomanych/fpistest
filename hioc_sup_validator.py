@@ -5,7 +5,6 @@ Independent of COS/PSOS operational states.
 """
 
 from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass
 from enum import Enum
 from opcua import Client
 import logging
@@ -21,39 +20,42 @@ class ValidationResult(Enum):
     MISSING_DATA = "missing_data"
 
 
-@dataclass
 class HTTComparisonResult:
     """Result of HTT threshold table comparison"""
-    result: ValidationResult
-    mismatches: List[str] = None
-    cg1_htt: Dict[int, Any] = None
-    cg2_htt: Dict[int, Any] = None
-    error_message: Optional[str] = None
+    def __init__(self, result: ValidationResult, mismatches: List[str] = None, 
+                 cg1_htt: Dict[int, Any] = None, cg2_htt: Dict[int, Any] = None, 
+                 error_message: Optional[str] = None):
+        self.result = result
+        self.mismatches = mismatches
+        self.cg1_htt = cg1_htt
+        self.cg2_htt = cg2_htt
+        self.error_message = error_message
 
 
-@dataclass
 class FIDSizeComparisonResult:
     """Result of FIDSize comparison for HIOCwSUP capability"""
-    result: ValidationResult
-    fid: str
-    cg1_fidsize: Optional[int] = None
-    cg2_fidsize: Optional[int] = None
-    both_support_sup: bool = False
-    error_message: Optional[str] = None
+    def __init__(self, result: ValidationResult, fid: str, cg1_fidsize: Optional[int] = None, 
+                 cg2_fidsize: Optional[int] = None, both_support_sup: bool = False, 
+                 error_message: Optional[str] = None):
+        self.result = result
+        self.fid = fid
+        self.cg1_fidsize = cg1_fidsize
+        self.cg2_fidsize = cg2_fidsize
+        self.both_support_sup = both_support_sup
+        self.error_message = error_message
 
 
-@dataclass
 class ControllerIDValidationResult:
     """Result of controller ID validation"""
-    result: ValidationResult
-    cg1_expected: int = 1464099
-    cg2_expected: int = 1464098
-    cg1_actual: Optional[int] = None
-    cg2_actual: Optional[int] = None
-    error_message: Optional[str] = None
-
-
-
+    def __init__(self, result: ValidationResult, cg1_expected: int = 1464099, 
+                 cg2_expected: int = 1464098, cg1_actual: Optional[int] = None, 
+                 cg2_actual: Optional[int] = None, error_message: Optional[str] = None):
+        self.result = result
+        self.cg1_expected = cg1_expected
+        self.cg2_expected = cg2_expected
+        self.cg1_actual = cg1_actual
+        self.cg2_actual = cg2_actual
+        self.error_message = error_message
 
 
 class HIOCSUPValidator:
@@ -109,8 +111,6 @@ class HIOCSUPValidator:
         except Exception as e:
             logger.error("Failed to read FIDSize{}: {}".format(fid, e))
             return None
-
-
 
     def compare_htt_tables(self) -> HTTComparisonResult:
         """Compare HTT threshold tables between CG1 and CG2"""
@@ -239,8 +239,6 @@ class HIOCSUPValidator:
                 result=ValidationResult.ERROR,
                 error_message="Error during controller ID validation: {}".format(e)
             )
-
-
 
     def validate_for_dual_hioc_operation(self, fid: str = None) -> Dict[str, Any]:
         """Comprehensive validation for dual HIOC operations"""

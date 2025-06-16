@@ -7,12 +7,13 @@ Inherits from HIOCOperator and adds SUP-specific functionality.
 import os
 import zlib
 import csv
+import time
 from typing import List, Optional
 from enum import Enum
 from opcua import ua
 
 # Import the base HIOCOperator
-from hioc_operator import HIOCOperator, HIOCOperationConfig, HIOCStep, HIOCStepResult
+from hioc_operator import HIOCOperator, HIOCOperationConfig, HIOCStep, HIOCStepResult, HIOCOperationType
 
 
 class SUPStep(Enum):
@@ -39,8 +40,8 @@ class SUPOperationConfig(HIOCOperationConfig):
     """Configuration for SUP operation - extends HIOC config"""
     def __init__(self, server_url, controller_id, fid, operation_type, 
                  csv_file_path=None, timeout_seconds=10.0, progress_callback=None):
-        super().__init__(server_url, controller_id, fid, operation_type, 
-                        None, timeout_seconds, progress_callback)
+        super(SUPOperationConfig, self).__init__(server_url, controller_id, fid, operation_type, 
+                                                None, timeout_seconds, progress_callback)
         self.csv_file_path = csv_file_path
 
 
@@ -61,7 +62,7 @@ class SUPOperator(HIOCOperator):
             progress_callback=config.progress_callback
         )
         
-        super().__init__(hioc_config)
+        super(SUPOperator, self).__init__(hioc_config)
         
         self.sup_config = config
         self.structured_parameters: List[int] = []
@@ -83,7 +84,7 @@ class SUPOperator(HIOCOperator):
             raise ValueError("CSV file path is required for SUP operations")
         
         if not os.path.exists(self.sup_config.csv_file_path):
-            raise ValueError(f"CSV file not found: {self.sup_config.csv_file_path}")
+            raise ValueError("CSV file not found: {}".format(self.sup_config.csv_file_path))
 
     def _get_next_hsup_sequence(self) -> int:
         """Get next HSUP challenge sequence number (independent from HIOC)"""
@@ -107,10 +108,10 @@ class SUPOperator(HIOCOperator):
     def _check_sup_capability(self) -> bool:
         """Check if FID supports SUP by reading HTT FIDSize"""
         try:
-            self._report_progress(f"Checking SUP capability for {self.config.fid}...")
+            self._report_progress("Checking SUP capability for {}...".format(self.config.fid))
             
             # Read FIDSize from HTT
-            fid_size_path = ['HTT', f'FIDSize{self.config.fid}']
+            fid_size_path = ['HTT', 'FIDSize{}'.format(self.config.fid)]
             fid_size_node = self.client.get_node("ns=2;s=" + ".".join(fid_size_path))
             fid_size = fid_size_node.get_value()
             
@@ -118,7 +119,8 @@ class SUPOperator(HIOCOperator):
             self.fidsize_value = fid_size
             
             self._log_sup_step(SUPStep.CAPABILITY_CHECK, True)
-            self._report_progress(f"FID {self.config.fid} FIDSize: {fid_size}, SUP capable: {self.is_sup_capable}")
+            self._report_progress("FID {} FIDSize: {}, SUP capable: {}".format(
+                self.config.fid, fid_size, self.is_sup_capable))
             
             return self.is_sup_capable
             
@@ -129,7 +131,7 @@ class SUPOperator(HIOCOperator):
     def _parse_csv_file(self) -> bool:
         """Parse CSV file with hex parameters"""
         try:
-            self._report_progress(f"Parsing CSV file: {self.sup_config.csv_file_path}")
+            self._report_progress("Parsing CSV file: {}".format(self.sup_config.csv_file_path))
             
             with open(self.sup_config.csv_file_path, 'r') as file:
                 # Read first line and strip whitespace/carriage returns
@@ -149,7 +151,7 @@ class SUPOperator(HIOCOperator):
                 try:
                     csv_fidsize = int(fidsize_hex, 16)
                 except ValueError:
-                    raise ValueError(f"Invalid hex FIDSize: {fidsize_hex}")
+                    raise ValueError("Invalid hex FIDSize: {}".format(fidsize_hex))
                 
                 # Validate parameter count (FIDSize = parameter count + 1)
                 expected_param_count = csv_fidsize - 1
@@ -157,14 +159,14 @@ class SUPOperator(HIOCOperator):
                 
                 if actual_param_count != expected_param_count:
                     raise ValueError(
-                        f"Parameter count mismatch: FIDSize {csv_fidsize} expects {expected_param_count} "
-                        f"parameters, but found {actual_param_count}"
+                        "Parameter count mismatch: FIDSize {} expects {} "
+                        "parameters, but found {}".format(csv_fidsize, expected_param_count, actual_param_count)
                     )
                 
                 # Validate against HTT FIDSize if available
                 if self.fidsize_value > 0 and csv_fidsize != self.fidsize_value:
                     raise ValueError(
-                        f"CSV FIDSize {csv_fidsize} doesn't match HTT FIDSize {self.fidsize_value}"
+                        "CSV FIDSize {} doesn't match HTT FIDSize {}".format(csv_fidsize, self.fidsize_value)
                     )
                 
                 # Convert hex parameters to uint32
@@ -173,19 +175,19 @@ class SUPOperator(HIOCOperator):
                     try:
                         param_value = int(hex_param, 16)
                         if param_value > 0xFFFFFFFF:
-                            raise ValueError(f"Parameter {i+1} exceeds uint32 range: {hex_param}")
+                            raise ValueError("Parameter {} exceeds uint32 range: {}".format(i+1, hex_param))
                         parameters.append(param_value)
                     except ValueError:
-                        raise ValueError(f"Invalid hex parameter at position {i+1}: {hex_param}")
+                        raise ValueError("Invalid hex parameter at position {}: {}".format(i+1, hex_param))
                 
                 # Validate parameter count limits
                 if len(parameters) > 511:
-                    raise ValueError(f"Too many parameters: {len(parameters)} (max 511)")
+                    raise ValueError("Too many parameters: {} (max 511)".format(len(parameters)))
                 
                 self.structured_parameters = parameters
                 
                 self._log_sup_step(SUPStep.CSV_PARSING, True)
-                self._report_progress(f"Parsed {len(parameters)} hex parameters from CSV")
+                self._report_progress("Parsed {} hex parameters from CSV".format(len(parameters)))
                 
                 return True
                 
@@ -384,7 +386,6 @@ class SUPOperator(HIOCOperator):
             value_node.set_value(ua.Variant(int(value) & 0xFFFFFFFF, ua.VariantType.UInt32))
             
             # Ensure ordering before writing SEQ
-            import time
             time.sleep(0.001)
             seq_node.set_value(ua.Variant(int(seq), ua.VariantType.Int32))
             
@@ -505,7 +506,7 @@ class SUPOperator(HIOCOperator):
                             9000000: "Controller abort",
                             9100000: "User abort", 
                             9300000: "Timeout abort"
-                        }.get(response_data['MSG'], f"Unknown abort: {response_data['MSG']}")
+                        }.get(response_data['MSG'], "Unknown abort: {}".format(response_data['MSG']))
                         
                         self._log_sup_step(response_step, False, response_data=response_data, 
                                          error_message=abort_msg)
@@ -549,7 +550,7 @@ class SUPOperator(HIOCOperator):
             return True
             
         except Exception as e:
-            self._report_progress(f"✗ HSUP sequence failed: {e}")
+            self._report_progress("✗ HSUP sequence failed: {}".format(e))
             return False
 
     def _perform_lock_parameters_recovery(self) -> bool:
@@ -683,7 +684,7 @@ def create_example_sup_operator():
     """Example of how to create and use SUPOperator"""
     
     def progress_callback(message: str):
-        print(f"Progress: {message}")
+        print("Progress: {}".format(message))
     
     # Example configuration for SUP operation
     config = SUPOperationConfig(

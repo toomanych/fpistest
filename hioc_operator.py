@@ -8,7 +8,6 @@ import time
 import threading
 from enum import Enum
 from typing import Callable, Optional, List, Dict, Any, Tuple
-from dataclasses import dataclass
 from opcua import Client, ua
 
 
@@ -19,6 +18,7 @@ class HIOCOperationType(Enum):
     OVERRIDE_UNSET = "override_unset"  # HIOC_BO
     DISABLE = "disable"              # HIOC_BO
     ENABLE = "enable"                # HIOC_BO
+    STRUCTURED_PARAMS = "structured_params"  # HIOCwSUP
 
 
 class HIOCStep(Enum):
@@ -36,28 +36,33 @@ class HIOCStep(Enum):
     ABORTED = "aborted"
 
 
-@dataclass
 class HIOCStepResult:
     """Result of a single HIOC step"""
-    step: HIOCStep
-    success: bool
-    timestamp: float
-    challenge_data: Optional[Dict[str, Any]] = None
-    response_data: Optional[Dict[str, Any]] = None
-    error_message: Optional[str] = None
-    timeout: bool = False
+    def __init__(self, step: HIOCStep, success: bool, timestamp: float, 
+                 challenge_data: Optional[Dict[str, Any]] = None, 
+                 response_data: Optional[Dict[str, Any]] = None, 
+                 error_message: Optional[str] = None, timeout: bool = False):
+        self.step = step
+        self.success = success
+        self.timestamp = timestamp
+        self.challenge_data = challenge_data
+        self.response_data = response_data
+        self.error_message = error_message
+        self.timeout = timeout
 
 
-@dataclass
 class HIOCOperationConfig:
     """Configuration for HIOC operation"""
-    server_url: str
-    controller_id: int
-    fid: str  # F0-F5
-    operation_type: HIOCOperationType
-    threshold_value: Optional[int] = None  # TH1-TH15 (1-15) for HIOC_TH operations
-    timeout_seconds: float = 10.0
-    progress_callback: Optional[Callable[[str], None]] = None
+    def __init__(self, server_url: str, controller_id: int, fid: str, 
+                 operation_type: HIOCOperationType, threshold_value: Optional[int] = None,
+                 timeout_seconds: float = 10.0, progress_callback: Optional[Callable[[str], None]] = None):
+        self.server_url = server_url
+        self.controller_id = controller_id
+        self.fid = fid  # F0-F5
+        self.operation_type = operation_type
+        self.threshold_value = threshold_value  # TH1-TH15 (1-15) for HIOC_TH operations
+        self.timeout_seconds = timeout_seconds
+        self.progress_callback = progress_callback
 
 
 class HIOCOperator:

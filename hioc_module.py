@@ -9,7 +9,6 @@ import threading
 import time
 import os
 from typing import Dict, List, Optional, Tuple, Any, Callable
-from dataclasses import dataclass
 from enum import Enum
 from opcua import Client, ua
 import logging
@@ -32,14 +31,15 @@ class HIOCDialogOperationType(Enum):
     PARAMETER_SET = "parameter_set"
 
 
-@dataclass
 class ServerConnection:
     """Server connection information"""
-    name: str
-    url: str
-    client: Optional[Client] = None
-    connected: bool = False
-    controller_id: Optional[int] = None
+    def __init__(self, name: str, url: str, client: Optional[Client] = None, 
+                 connected: bool = False, controller_id: Optional[int] = None):
+        self.name = name
+        self.url = url
+        self.client = client
+        self.connected = connected
+        self.controller_id = controller_id
 
 
 class HIOCDialog:
