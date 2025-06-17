@@ -1,6 +1,7 @@
 """
 Main GUI Application
 ITER OPC-UA Control System with HIOC/HIOCwSUP, COS/PSOS, and IOP support
+UPDATED: Added minimal variable monitoring integration
 """
 
 import tkinter as tk
@@ -14,6 +15,9 @@ import logging
 # Import our modules
 from cos_operator import COSOperator, COSCommand, COSState, PSOSState, SystemState
 from hioc_module import HIOCDialog, ServerConnection
+
+# NEW: Import variable monitoring functionality
+from variable_monitor_dialog import create_variable_monitor_dialog, MonitorVariable
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,7 +36,7 @@ class MainGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("ITER OPC-UA Control System - COS/PSOS/IOP/HIOC")
-        self.root.geometry("1400x900")
+        self.root.geometry("1280x600")  # CHANGED: Updated window size
         
         # Server configurations with ServerConnection objects
         self.servers = {
@@ -51,6 +55,9 @@ class MainGUI:
                 url='opc.tcp://4602tv-SRV-5101.codac.iter.org:4840'
             )
         }
+        
+        # NEW: Custom variables for monitoring
+        self.custom_variables = []  # List[MonitorVariable]
         
         # COS operator for CG1/CG2
         self.cos_operator = COSOperator()
@@ -178,7 +185,7 @@ class MainGUI:
             )
             btn.grid(row=0, column=i, padx=5, pady=5, sticky=(tk.W, tk.E))
         
-        # HIOC Commands frame
+        # HIOC Commands frame - UPDATED: Added variable monitor button
         hioc_frame = ttk.LabelFrame(parent, text="HIOC Configuration", padding="10")
         hioc_frame.grid(row=1, column=2, sticky=(tk.W, tk.E, tk.N), pady=(0, 10), padx=(10, 0))
         
@@ -188,6 +195,14 @@ class MainGUI:
             command=self.open_hioc_dialog,
             width=15
         ).grid(row=0, column=0, padx=5, pady=5)
+        
+        # NEW: Add Variable Monitor button
+        ttk.Button(
+            hioc_frame,
+            text="Add Variable\nMonitor",
+            command=self.open_variable_monitor_dialog,
+            width=15
+        ).grid(row=0, column=1, padx=5, pady=5)
 
     def create_status_frame(self, parent):
         """Create status monitoring frame"""
@@ -207,6 +222,7 @@ class MainGUI:
         """Create status frame for individual server"""
         server_frame = ttk.LabelFrame(parent, text="{} Status".format(server_name), padding="10")
         server_frame.grid(row=0, column=column, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5)
+        server_frame.config(width=340)  # NEW: Set fixed width for each server pane
         
         self.server_status_frames[server_name] = server_frame
         self.status_labels[server_name] = {}
@@ -240,6 +256,10 @@ class MainGUI:
                 row=row, column=1, sticky=(tk.W, tk.E), padx=(5, 0), pady=2)
             row += 1
         
+        # NEW: Custom variables will be added here (below PSOS, before IOP)
+        # Store the current row for later use
+        self.status_labels[server_name]['_custom_row_start'] = row
+        
         # IOP Status
         ttk.Label(server_frame, text="IOP Status:", font=('TkDefaultFont', 9, 'bold')).grid(
             row=row, column=0, sticky=tk.W, pady=2)
@@ -257,6 +277,182 @@ class MainGUI:
                 server_frame, text="N/A", relief="sunken", width=25, anchor="center")
             self.status_labels[server_name]['PCS_WD'].grid(
                 row=row, column=1, sticky=(tk.W, tk.E), padx=(5, 0), pady=2)
+
+    # NEW: Method to add custom variables
+    def add_custom_variable(self, monitor_var: MonitorVariable):
+        """Add a custom variable to monitoring"""
+        self.custom_variables.append(monitor_var)
+        logger.info("Added custom variable '{}' for server '{}' at path: {}".format(
+            monitor_var.label, monitor_var.server_name, monitor_var.get_browse_path_string()))
+        
+        # Update the display for this server
+        self.update_custom_variables_display(monitor_var.server_name)
+
+    # NEW: Method to open variable monitor dialog
+    def open_variable_monitor_dialog(self):
+        """Open the variable monitor dialog"""
+        try:
+            create_variable_monitor_dialog(self.root, self.servers, self.add_custom_variable)
+        except Exception as e:
+            messagebox.showerror("Dialog Error", "Failed to open variable monitor dialog:\n{}".format(e))
+            logger.error("Failed to open variable monitor dialog: {}".format(e))
+
+    # NEW: Update custom variables display
+    def update_custom_variables_display(self, server_name: str):
+        """Update display of custom variables for a specific server - insert between PSOS and IOP"""
+        if server_name not in self.status_labels:
+            return
+        
+        server_frame = self.server_status_frames[server_name]
+        
+        # Remove existing custom variable labels
+        for widget_name in list(self.status_labels[server_name].keys()):
+            if widget_name.startswith('custom_'):
+                widget = self.status_labels[server_name][widget_name]
+                widget.destroy()
+                del self.status_labels[server_name][widget_name]
+        
+        # Get custom variables for this server
+        server_custom_vars = [v for v in self.custom_variables if v.server_name == server_name]
+        
+        # Get the starting row for custom variables (after PSOS, before IOP)
+        custom_row_start = self.status_labels[server_name]['_custom_row_start']
+        
+        if server_custom_vars:
+            # Calculate total rows needed for custom variables
+            num_custom_vars = len(server_custom_vars)
+            
+            # First, move IOP and PCS_WD widgets down to make space
+            # Find and move IOP label and value
+            iop_row = custom_row_start  # IOP was originally at custom_row_start
+            new_iop_row = custom_row_start + num_custom_vars
+            
+            # Move IOP label
+            for widget in server_frame.grid_slaves(row=iop_row, column=0):
+                if isinstance(widget, ttk.Label) and "IOP" in widget.cget("text"):
+                    widget.grid(row=new_iop_row, column=0, sticky=tk.W, pady=2)
+                    break
+            
+            # Move IOP value
+            if 'IOP' in self.status_labels[server_name]:
+                self.status_labels[server_name]['IOP'].grid(
+                    row=new_iop_row, column=1, sticky=(tk.W, tk.E), padx=(5, 0), pady=2)
+            
+            # Move PCS_WD widgets if they exist (only for CG1/CG2)
+            if server_name in ['CG1', 'CG2'] and 'PCS_WD' in self.status_labels[server_name]:
+                pcs_wd_row = iop_row + 1  # PCS_WD was originally after IOP
+                new_pcs_wd_row = new_iop_row + 1
+                
+                # Move PCS_WD label
+                for widget in server_frame.grid_slaves(row=pcs_wd_row, column=0):
+                    if isinstance(widget, ttk.Label) and "PCS WD" in widget.cget("text"):
+                        widget.grid(row=new_pcs_wd_row, column=0, sticky=tk.W, pady=2)
+                        break
+                
+                # Move PCS_WD value
+                self.status_labels[server_name]['PCS_WD'].grid(
+                    row=new_pcs_wd_row, column=1, sticky=(tk.W, tk.E), padx=(5, 0), pady=2)
+            
+            # Now add custom variables in the cleared space
+            for i, monitor_var in enumerate(server_custom_vars):
+                row = custom_row_start + i
+                
+                # Create label
+                var_label = ttk.Label(server_frame, text="{}:".format(monitor_var.label), 
+                                     font=('TkDefaultFont', 9, 'bold'))
+                var_label.grid(row=row, column=0, sticky=tk.W, pady=2)
+                
+                # Create value label with appropriate color
+                if monitor_var.current_value == "Error":
+                    value_color = "red"
+                elif monitor_var.current_value == "N/A":
+                    value_color = "gray"
+                else:
+                    value_color = "black"
+                
+                var_value = ttk.Label(server_frame, text=monitor_var.current_value, 
+                                     relief="sunken", width=25, anchor="center", foreground=value_color)
+                var_value.grid(row=row, column=1, sticky=(tk.W, tk.E), padx=(5, 0), pady=2)
+                
+                # Store references
+                self.status_labels[server_name]['custom_{}_label'.format(i)] = var_label
+                self.status_labels[server_name]['custom_{}_value'.format(i)] = var_value
+                
+                # Store reference in monitor variable for updates
+                monitor_var._gui_label = var_value
+        
+        else:
+            # No custom variables - make sure IOP and PCS_WD are in their original positions
+            # Move IOP back to original position if it was moved
+            if 'IOP' in self.status_labels[server_name]:
+                # Find IOP label and move back
+                for widget in server_frame.grid_slaves():
+                    if isinstance(widget, ttk.Label) and "IOP" in widget.cget("text"):
+                        widget.grid(row=custom_row_start, column=0, sticky=tk.W, pady=2)
+                        break
+                
+                # Move IOP value back
+                self.status_labels[server_name]['IOP'].grid(
+                    row=custom_row_start, column=1, sticky=(tk.W, tk.E), padx=(5, 0), pady=2)
+            
+            # Move PCS_WD back if it exists
+            if server_name in ['CG1', 'CG2'] and 'PCS_WD' in self.status_labels[server_name]:
+                for widget in server_frame.grid_slaves():
+                    if isinstance(widget, ttk.Label) and "PCS WD" in widget.cget("text"):
+                        widget.grid(row=custom_row_start + 1, column=0, sticky=tk.W, pady=2)
+                        break
+                
+                self.status_labels[server_name]['PCS_WD'].grid(
+                    row=custom_row_start + 1, column=1, sticky=(tk.W, tk.E), padx=(5, 0), pady=2)
+
+    # NEW: Update custom variables in background monitoring
+    def update_custom_variables(self):
+        """Update custom variables from background thread"""
+        for monitor_var in self.custom_variables:
+            server_name = monitor_var.server_name
+            
+            if server_name in self.servers and self.servers[server_name].connected:
+                try:
+                    client = self.servers[server_name].client
+                    objects = client.get_objects_node()
+                    
+                    # Navigate through the browse path
+                    current_node = objects
+                    for element in monitor_var.browse_path:
+                        current_node = current_node.get_child([element])
+                    
+                    # Read the value
+                    value = current_node.get_value()
+                    monitor_var.current_value = str(value)
+                    monitor_var.last_error = None
+                    
+                    # Update GUI label if it exists
+                    if hasattr(monitor_var, '_gui_label') and monitor_var._gui_label:
+                        def update_label(v=str(value), l=monitor_var._gui_label):
+                            l.config(text=v, foreground="black")
+                        self.root.after(0, update_label)
+                    
+                except Exception as e:
+                    monitor_var.current_value = "Error"
+                    monitor_var.last_error = str(e)
+                    
+                    # Update GUI label if it exists
+                    if hasattr(monitor_var, '_gui_label') and monitor_var._gui_label:
+                        def update_error_label(l=monitor_var._gui_label):
+                            l.config(text="Error", foreground="red")
+                        self.root.after(0, update_error_label)
+                    
+                    logger.debug("Failed to read custom variable '{}' for {}: {}".format(
+                        monitor_var.label, server_name, e))
+            else:
+                monitor_var.current_value = "N/A"
+                monitor_var.last_error = "Server not connected"
+                
+                # Update GUI label if it exists
+                if hasattr(monitor_var, '_gui_label') and monitor_var._gui_label:
+                    def update_na_label(l=monitor_var._gui_label):
+                        l.config(text="N/A", foreground="gray")
+                    self.root.after(0, update_na_label)
 
     def update_server_url(self, server_name: str, url: str):
         """Update server URL"""
@@ -485,6 +681,9 @@ class MainGUI:
                     if self.servers[server_name].connected:
                         threshold = self.read_pcs_wd_threshold(server_name)
                         self.root.after(0, self.update_pcs_wd_display, server_name, threshold)
+                
+                # NEW: Update custom variables
+                self.update_custom_variables()
                 
                 time.sleep(0.3)  # 300ms polling
                 
