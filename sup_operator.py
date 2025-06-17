@@ -2,6 +2,10 @@
 SUP Protocol Implementation
 Contains HIOCwSUPOperator (extends HIOCOperator) and SUPOperator for HIOCwSUP operations.
 Clean implementation following the specified protocol flow.
+
+FIXED: Corrected HSUP flow for CTFSS_POPULATE case:
+- HSUP_STEP1_CHALLENGE → HSUP_STEP2_RESPONSE (server skips to step 2 since data buffered)
+- HSUP_STEP3_CHALLENGE → HSUP_STEP3_RESPONSE (final confirmation)
 """
 
 import time
@@ -22,7 +26,7 @@ class SUPStep(Enum):
     CTFSS_POPULATE = "ctfss_populate"
     HSUP_STEP1_CHALLENGE = "hsup_step1_challenge"
     HSUP_STEP1_RESPONSE = "hsup_step1_response"
-    HSUP_STEP2_CHALLENGE = "hsup_step2_challenge"
+    HSUP_STEP2_CHALLENGE = "hsup_step2_challenge"  # Reserved for future single-value uploads
     HSUP_STEP2_RESPONSE = "hsup_step2_response"
     HSUP_STEP3_CHALLENGE = "hsup_step3_challenge"
     HSUP_STEP3_RESPONSE = "hsup_step3_response"
@@ -167,6 +171,9 @@ class SUPOperator:
             }
             
             self._log_sup_step(SUPStep.NONCE_REQUEST, True, challenge_data=challenge_data)
+            self._report_progress("Challenge sent: CTR={}, FLG={}, MSG={}, VALUE={}, SEQ={}".format(
+                challenge_data['CTR'], challenge_data['FLG'], challenge_data['MSG'], 
+                challenge_data['VALUE'], challenge_data['SEQ']))
             
             # Wait for nonce response
             success, response_data = self._wait_for_hsup_response(12, challenge_data)
@@ -323,35 +330,29 @@ class SUPOperator:
 
     def perform_hsup_sequence(self) -> bool:
         """
-        Perform HSUP 3-step sequence.
+        Perform HSUP sequence for CTFSS_POPULATE case.
         
-        Flow:
-        1. HSUP_STEP1: FLG=1, MSG=FunctionID
-        2. HSUP_STEP2: FLG=3, MSG=CommandID
-        3. HSUP_STEP3: FLG=5, MSG=ConfirmationID
+        CORRECTED Flow (when using CTFSS buffer):
+        1. HSUP_STEP1: FLG=1, MSG=FunctionID → expect FLG=4 (step 2 response, server skips step 1 response)
+        2. HSUP_STEP3: FLG=5, MSG=ConfirmationID → expect FLG=6 (step 3 response)
+        
+        Note: HSUP_STEP2_CHALLENGE is reserved for future single-value upload mode.
         """
         try:
-            self._report_progress("Starting HSUP 3-step sequence...")
+            self._report_progress("Starting HSUP sequence (CTFSS buffered mode)...")
             
             fid_num = int(self.config.fid[1:])
             
-            # Step 1: Function validation
-            if not self._perform_hsup_step(1, 2, 2460000 + fid_num):  # FunctionID
+            # Step 1: Function validation → expect Step 2 response (server skips to step 2 since data buffered)
+            if not self._perform_hsup_step_1_to_2_response(2460000 + fid_num):  # FunctionID
                 return False
             
             if self.abort_requested:
                 return False
             
-            # Step 2: Command
-            if not self._perform_hsup_step(2, 4, 3460050):  # CommandID with CC=50
-                return False
-            
-            if self.abort_requested:
-                return False
-            
-            # Step 3: Confirmation
+            # Step 3: Confirmation → expect Step 3 response
             confirmation_id = 4000000 + fid_num * 100 + 50  # ConfirmationID with CC=50
-            if not self._perform_hsup_step(3, 6, confirmation_id):
+            if not self._perform_hsup_step_3(confirmation_id):
                 return False
             
             self._report_progress("✓ HSUP sequence completed successfully")
@@ -361,20 +362,14 @@ class SUPOperator:
             self._report_progress("✗ HSUP sequence failed: {}".format(e))
             return False
 
-    def _perform_hsup_step(self, step_num: int, expected_flag: int, msg_id: int) -> bool:
-        """Perform a single HSUP step"""
+    def _perform_hsup_step_1_to_2_response(self, function_id: int) -> bool:
+        """
+        Perform HSUP step 1 challenge expecting step 2 response (CTFSS buffered case).
+        
+        Challenge: FLG=1, MSG=FunctionID
+        Expected Response: FLG=4 (step 2 response, since server skips step 1 response due to buffered data)
+        """
         try:
-            step_mapping = {
-                1: (SUPStep.HSUP_STEP1_CHALLENGE, SUPStep.HSUP_STEP1_RESPONSE),
-                2: (SUPStep.HSUP_STEP2_CHALLENGE, SUPStep.HSUP_STEP2_RESPONSE),
-                3: (SUPStep.HSUP_STEP3_CHALLENGE, SUPStep.HSUP_STEP3_RESPONSE)
-            }
-            
-            challenge_step, response_step = step_mapping[step_num]
-            
-            flag_mapping = {1: 1, 2: 3, 3: 5}  # Step to flag mapping
-            flag = flag_mapping[step_num]
-            
             # FIXED: Calculate ConfirmationID for VALUE field
             fid_num = int(self.config.fid[1:])
             unlock_command_code = 50  # Unlock command code
@@ -392,50 +387,100 @@ class SUPOperator:
             
             # Write challenge data (SEQ last)
             ctr_node.set_value(ua.Variant(self.config.controller_id, ua.VariantType.UInt32))
-            flg_node.set_value(ua.Variant(flag, ua.VariantType.UInt32))
-            msg_node.set_value(ua.Variant(msg_id, ua.VariantType.UInt32))
-            value_node.set_value(ua.Variant(confirmation_id, ua.VariantType.UInt32))  # FIXED: ConfirmationID
+            flg_node.set_value(ua.Variant(1, ua.VariantType.UInt32))  # Step 1 flag
+            msg_node.set_value(ua.Variant(function_id, ua.VariantType.UInt32))
+            value_node.set_value(ua.Variant(confirmation_id, ua.VariantType.UInt32))  # ConfirmationID
             time.sleep(0.001)
             seq_node.set_value(ua.Variant(seq, ua.VariantType.Int32))
             
             challenge_data = {
-                'CTR': self.config.controller_id, 'FLG': flag, 'MSG': msg_id, 
-                'VALUE': confirmation_id, 'SEQ': seq  # FIXED: ConfirmationID in log
+                'CTR': self.config.controller_id, 'FLG': 1, 'MSG': function_id, 
+                'VALUE': confirmation_id, 'SEQ': seq
             }
             
-            self._log_sup_step(challenge_step, True, challenge_data=challenge_data)
+            self._log_sup_step(SUPStep.HSUP_STEP1_CHALLENGE, True, challenge_data=challenge_data)
+            self._report_progress("Challenge sent: CTR={}, FLG={}, MSG={}, VALUE={}, SEQ={}".format(
+                challenge_data['CTR'], challenge_data['FLG'], challenge_data['MSG'], 
+                challenge_data['VALUE'], challenge_data['SEQ']))
             
-            # Wait for response
-            success, response_data = self._wait_for_hsup_response(expected_flag, challenge_data)
+            # CORRECTED: Wait for step 2 response (FLG=4) instead of step 1 response (FLG=2)
+            success, response_data = self._wait_for_hsup_response(4, challenge_data)  # Expect FLG=4
+            
+            if success:
+                self._update_hsup_sequence(response_data['SEQ'])
+                self._log_sup_step(SUPStep.HSUP_STEP2_RESPONSE, True, response_data=response_data)
+                self._report_progress("✓ Server responded with step 2 (data buffered, skipped step 1 response)")
+                return True
+            else:
+                self._log_sup_step(SUPStep.HSUP_STEP2_RESPONSE, False, 
+                                 error_message="Expected step 2 response (FLG=4) timeout or abort", timeout=True)
+                return False
+                
+        except Exception as e:
+            self._log_sup_step(SUPStep.HSUP_STEP1_CHALLENGE, False, error_message=str(e))
+            return False
+
+    def _perform_hsup_step_3(self, confirmation_id: int) -> bool:
+        """Perform HSUP step 3 (final confirmation)"""
+        try:
+            fid_num = int(self.config.fid[1:])
+            function_id = 2460000 + fid_num  # FunctionID format: 246NNNN
+            
+            seq = self._get_next_hsup_sequence()
+            
+            # Write to HSUPIn interface
+            objects = self.client.get_objects_node()
+            ctr_node = objects.get_child(["1:HSUPIn", "1:{}".format(self.config.fid), "1:CTF", "1:CTR"])
+            flg_node = objects.get_child(["1:HSUPIn", "1:{}".format(self.config.fid), "1:CTF", "1:FLG"])
+            msg_node = objects.get_child(["1:HSUPIn", "1:{}".format(self.config.fid), "1:CTF", "1:MSG"])
+            value_node = objects.get_child(["1:HSUPIn", "1:{}".format(self.config.fid), "1:CTF", "1:VALUE"])
+            seq_node = objects.get_child(["1:HSUPIn", "1:{}".format(self.config.fid), "1:CTF", "1:SEQ"])
+            
+            # Write challenge data (SEQ last)
+            ctr_node.set_value(ua.Variant(self.config.controller_id, ua.VariantType.UInt32))
+            flg_node.set_value(ua.Variant(5, ua.VariantType.UInt32))  # Step 3 flag
+            msg_node.set_value(ua.Variant(function_id, ua.VariantType.UInt32))  # FIXED: FunctionID not ConfirmationID
+            value_node.set_value(ua.Variant(confirmation_id, ua.VariantType.UInt32))  # ConfirmationID
+            time.sleep(0.001)
+            seq_node.set_value(ua.Variant(seq, ua.VariantType.Int32))
+            
+            challenge_data = {
+                'CTR': self.config.controller_id, 'FLG': 5, 'MSG': function_id,  # FIXED: FunctionID 
+                'VALUE': confirmation_id, 'SEQ': seq
+            }
+            
+            self._log_sup_step(SUPStep.HSUP_STEP3_CHALLENGE, True, challenge_data=challenge_data)
+            self._report_progress("Challenge sent: CTR={}, FLG={}, MSG={}, VALUE={}, SEQ={}".format(
+                challenge_data['CTR'], challenge_data['FLG'], challenge_data['MSG'], 
+                challenge_data['VALUE'], challenge_data['SEQ']))
+            
+            # Wait for step 3 response
+            success, response_data = self._wait_for_hsup_response(6, challenge_data)  # Expect FLG=6
             
             if success:
                 self._update_hsup_sequence(response_data['SEQ'])
                 
                 # Check for success/abort in final step
-                if step_num == 3:
-                    if response_data['MSG'] == 7500000:  # SuccessID
-                        self._log_sup_step(response_step, True, response_data=response_data)
-                        return True
-                    else:
-                        abort_msg = {
-                            9000000: "Controller abort",
-                            9100000: "User abort", 
-                            9300000: "Timeout abort"
-                        }.get(response_data['MSG'], "Unknown abort: {}".format(response_data['MSG']))
-                        
-                        self._log_sup_step(response_step, False, response_data=response_data, 
-                                         error_message=abort_msg)
-                        return False
-                else:
-                    self._log_sup_step(response_step, True, response_data=response_data)
+                if response_data['MSG'] == 7500000:  # SuccessID
+                    self._log_sup_step(SUPStep.HSUP_STEP3_RESPONSE, True, response_data=response_data)
                     return True
+                else:
+                    abort_msg = {
+                        9000000: "Controller abort",
+                        9100000: "User abort", 
+                        9300000: "Timeout abort"
+                    }.get(response_data['MSG'], "Unknown abort: {}".format(response_data['MSG']))
+                    
+                    self._log_sup_step(SUPStep.HSUP_STEP3_RESPONSE, False, response_data=response_data, 
+                                     error_message=abort_msg)
+                    return False
             else:
-                self._log_sup_step(response_step, False, 
-                                 error_message="HSUP response timeout or abort", timeout=True)
+                self._log_sup_step(SUPStep.HSUP_STEP3_RESPONSE, False, 
+                                 error_message="Step 3 response timeout or abort", timeout=True)
                 return False
                 
         except Exception as e:
-            self._log_sup_step(challenge_step, False, error_message=str(e))
+            self._log_sup_step(SUPStep.HSUP_STEP3_CHALLENGE, False, error_message=str(e))
             return False
 
     def execute_operation(self) -> bool:
@@ -453,7 +498,7 @@ class SUPOperator:
             if self.abort_requested:
                 return False
             
-            # Step 2: Perform HSUP sequence
+            # Step 2: Perform HSUP sequence (corrected flow)
             if not self.perform_hsup_sequence():
                 return False
             
@@ -623,3 +668,11 @@ def create_example_hiocwsup_flow():
 # 4. Parameters are parsed by hioc_module.py and passed to SUPOperator
 #
 # 5. Progress reporting goes to the same HIOC dialog text box
+#
+# CORRECTED HSUP FLOW SUMMARY:
+# - When using CTFSS_POPULATE, the server recognizes buffered data
+# - HSUP_STEP1_CHALLENGE (FLG=1) → server responds with HSUP_STEP2_RESPONSE (FLG=4)
+# - Server skips HSUP_STEP1_RESPONSE because data is already buffered
+# - HSUP_STEP3_CHALLENGE (FLG=5) → HSUP_STEP3_RESPONSE (FLG=6, MSG=SuccessID/AbortID)
+# - HSUP_STEP2_CHALLENGE is reserved for future single-value upload mode
+            
