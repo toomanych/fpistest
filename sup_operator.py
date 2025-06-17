@@ -302,8 +302,10 @@ class SUPOperator:
         
             # Create 512-element array with parameters + zeros
             data_array = self.config.parameters + [0] * (512 - len(self.config.parameters))
-            data_variants = [ua.Variant(val, ua.VariantType.UInt32) for val in data_array]
-            data_node.set_value(data_variants)
+            current_data_value = data_node.get_data_value()
+            # Obtain the exact variant type here because the data_node is an opcua array.
+            data_variant_type = current_data_value.Value.VariantType
+            data_node.set_value(ua.Variant(data_array, data_variant_type))
         
             self._log_sup_step(SUPStep.CTFSS_POPULATE, True)
             self._report_progress("✓ CTFSS buffer populated successfully")
@@ -373,6 +375,11 @@ class SUPOperator:
             flag_mapping = {1: 1, 2: 3, 3: 5}  # Step to flag mapping
             flag = flag_mapping[step_num]
             
+            # FIXED: Calculate ConfirmationID for VALUE field
+            fid_num = int(self.config.fid[1:])
+            unlock_command_code = 50  # Unlock command code
+            confirmation_id = 4000000 + fid_num * 100 + unlock_command_code  # ConfirmationID: 4NNNNCC
+            
             seq = self._get_next_hsup_sequence()
             
             # Write to HSUPIn interface
@@ -387,12 +394,13 @@ class SUPOperator:
             ctr_node.set_value(ua.Variant(self.config.controller_id, ua.VariantType.UInt32))
             flg_node.set_value(ua.Variant(flag, ua.VariantType.UInt32))
             msg_node.set_value(ua.Variant(msg_id, ua.VariantType.UInt32))
-            value_node.set_value(ua.Variant(0, ua.VariantType.UInt32))
+            value_node.set_value(ua.Variant(confirmation_id, ua.VariantType.UInt32))  # FIXED: ConfirmationID
             time.sleep(0.001)
             seq_node.set_value(ua.Variant(seq, ua.VariantType.Int32))
             
             challenge_data = {
-                'CTR': self.config.controller_id, 'FLG': flag, 'MSG': msg_id, 'VALUE': 0, 'SEQ': seq
+                'CTR': self.config.controller_id, 'FLG': flag, 'MSG': msg_id, 
+                'VALUE': confirmation_id, 'SEQ': seq  # FIXED: ConfirmationID in log
             }
             
             self._log_sup_step(challenge_step, True, challenge_data=challenge_data)
