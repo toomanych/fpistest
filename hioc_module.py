@@ -1,8 +1,7 @@
 """
-HIOC Module
-Contains HIOCOperator, HIOCwSUPOperator, SUPOperator, HIOCSUPValidator and HIOC Dialog for GUI integration.
-Complete implementation with all required widgets and functionality.
-UPDATED: Clean integration with new SUP implementation.
+HIOC Module - Simplified with HIOCSUPValidator
+Removes all custom HTT request code and delegates to HIOCSUPValidator.
+Clean integration with proper radio button enabling logic.
 """
 
 import tkinter as tk
@@ -20,7 +19,7 @@ logger = logging.getLogger(__name__)
 from hioc_operator import HIOCOperator, HIOCOperationConfig, HIOCOperationType, HIOCStep
 from sup_operator import SUPOperator, SUPOperationConfig
 from hiocwsup_operator import HIOCwSUPOperator  
-from hioc_sup_validator import HIOCSUPValidator, ValidationResult
+from hioc_sup_validator import HIOCSUPValidator
 
 
 class ServerConnection:
@@ -37,7 +36,7 @@ class ServerConnection:
 class HIOCDialog:
     """
     Unified HIOC dialog that handles both HIOC and HIOCwSUP operations.
-    Automatically selects appropriate operator based on operation type.
+    Uses HIOCSUPValidator for all HTT validation and capability checking.
     """
     
     def __init__(self, parent, servers: Dict[str, ServerConnection]):
@@ -54,20 +53,20 @@ class HIOCDialog:
         self.log_text = None
         self.file_path_var = None
         self.parameter_set_radio = None
+        self.threshold_radio = None  # NEW: Reference to threshold radio button
         self.file_frame = None
         self.file_status_label = None
         
         # Operation data
-        self.htt_values = {}
-        self.fidsize_values = {}
-        self.selected_threshold = None
         self.selected_file_path = None
         self.parsed_fidsize = None        # Parsed FIDSize from parameter file
         self.parsed_parameters = None     # Parsed parameter list from file
         
-        # Operators and validator
+        # Validation state - managed by HIOCSUPValidator
+        self.current_validator = None     # Current HIOCSUPValidator instance
+        
+        # Operators
         self.current_operator = None
-        self.validator = None
 
     def show(self):
         """Show HIOC operation dialog"""
@@ -106,11 +105,7 @@ class HIOCDialog:
                                 state="readonly", width=5)
         self.fid_combo.grid(row=0, column=3, padx=5)
         self.fid_combo.current(0)
-        
-        # Only use event binding - StringVar trace was causing duplicates
         self.fid_combo.bind('<<ComboboxSelected>>', self.on_fid_change)
-        
-        logger.info("FID combobox created with event binding")
         
         # Operation type selection
         op_frame = ttk.LabelFrame(self.dialog, text="Operation Type", padding="5")
@@ -131,11 +126,13 @@ class HIOCDialog:
                                value=value, command=self.on_operation_change)
             rb.grid(row=i//2, column=i%2, sticky="w", padx=10, pady=2)
             
-            # Store reference to parameter set radio button
+            # Store references to specific radio buttons
             if value == "parameter_set":
                 self.parameter_set_radio = rb
-                # Initially disabled until FIDSize check
-                rb.configure(state="disabled")
+                rb.configure(state="disabled")  # Initially disabled
+            elif value == "threshold":
+                self.threshold_radio = rb
+                rb.configure(state="disabled")  # Initially disabled until validation
         
         # File selection frame (initially hidden)
         self.file_frame = ttk.LabelFrame(self.dialog, text="Parameter File Selection", padding="5")
@@ -197,253 +194,127 @@ class HIOCDialog:
             return
             
         # Update combobox
-        server_combo = None
-        for widget in self.dialog.winfo_children():
-            if isinstance(widget, ttk.LabelFrame) and widget.cget("text") == "Server and Function Selection":
-                for child in widget.winfo_children():
-                    if isinstance(child, ttk.Combobox) and child.cget("textvariable") == str(self.server_var):
-                        server_combo = child
-                        break
-                break
-        
-        if server_combo:
-            server_combo.config(values=connected_servers)
-            if connected_servers:
-                server_combo.current(0)
+        self.server_combo.config(values=connected_servers)
+        if connected_servers:
+            self.server_combo.current(0)
 
     def on_server_change(self, event=None):
-        """Handle server selection change"""
-        # Server change doesn't trigger capability check - only FID change does
-        pass
+        """Handle server selection change - trigger FID capability check"""
+        self.check_fid_capabilities()
 
     def on_fid_change(self, event=None):
-        """Handle FID selection change via event binding"""
-        logger.info("=== FID CHANGE EVENT TRIGGERED ===")
-        
-        # Directly read the current selection from the combobox widget
-        current_fid = self.fid_combo.get()
-        
+        """Handle FID selection change"""
         # Update the StringVar to match the actual selection
+        current_fid = self.fid_combo.get()
         self.fid_var.set(current_fid)
         
-        logger.info("FID changed to: {}".format(current_fid))
-        
-        # Now check capabilities with the correct FID value
+        # Check capabilities with HIOCSUPValidator
         self.check_fid_capabilities()
     
-    def _delayed_fid_capability_check(self):
-        """Delayed capability check to ensure FID variable is updated"""
-        fid = self.fid_var.get()
-        logger.debug("FID capability check triggered for: {}".format(fid))
-        self.check_fid_capabilities()
-
     def check_fid_capabilities(self):
-        """Check FID capabilities and update UI accordingly"""
+        """Check FID capabilities using HIOCSUPValidator"""
         server = self.server_var.get()
         fid = self.fid_var.get()
         
-        logger.debug("Checking FID capabilities: server={}, fid={}".format(server, fid))
-        
         if not server or not fid:
-            logger.debug("Server or FID not selected, skipping capability check")
+            self.disable_all_operation_types("Server or FID not selected")
             return
-            
-        # For dual operations, check both servers with proper HTT validation
-        if server == "CG1 & CG2":
-            self.check_dual_fid_capabilities(fid)
-        elif server in ['CG1', 'CG2']:
-            self.check_single_fid_capabilities(server, fid)
-
-    def check_single_fid_capabilities(self, server: str, fid: str):
-        """Check FID capabilities for single server"""
-        if server not in self.servers or not self.servers[server].connected:
-            self.disable_parameter_set("Server not connected")
-            return
-            
-        server_info = self.servers[server]
         
-        # Use HIOCOperator to perform HTT request
-        htt_populated = self.perform_htt_request_for_fidsize(server_info, fid)
-        
-        if htt_populated:
-            fidsize = self.read_fidsize(server_info.client, fid)
-            if fidsize is not None and fidsize > 1:
-                self.enable_parameter_set()
-                logger.info("FIDSize check for {} on {}: {} - HIOCwSUP enabled".format(fid, server, fidsize))
+        # Create validator based on server selection
+        try:
+            if server == "CG1 & CG2":
+                if not (self.servers['CG1'].connected and self.servers['CG2'].connected):
+                    self.disable_all_operation_types("CG1 or CG2 not connected")
+                    return
+                    
+                validator = HIOCSUPValidator(
+                    self.servers['CG1'].client,
+                    self.servers['CG2'].client,
+                    progress_callback=self.update_progress,
+                    cg1_controller_id=self.servers['CG1'].controller_id,
+                    cg2_controller_id=self.servers['CG2'].controller_id
+                )
+            elif server in ['CG1', 'CG2']:
+                if not self.servers[server].connected:
+                    self.disable_all_operation_types("{} not connected".format(server))
+                    return
+                    
+                validator = HIOCSUPValidator(
+                    self.servers[server].client,
+                    progress_callback=self.update_progress,
+                    cg1_controller_id=self.servers[server].controller_id
+                )
             else:
-                self.disable_parameter_set("FIDSize ≤ 1 on {}".format(server))
+                self.disable_all_operation_types("Invalid server selection")
+                return
+            
+            # Perform validation
+            self.log_message("=== FID CAPABILITY CHECK FOR {} ===".format(fid))
+            validation_success = validator.validate(fid)
+            
+            if validation_success:
+                self.current_validator = validator
+                self.enable_operation_types_based_on_validation()
+                self.log_message("✓ Capability check completed successfully")
+                self.log_message(validator.get_validation_summary())
+            else:
+                self.current_validator = None
+                self.disable_all_operation_types("HTT validation failed")
+                self.log_message("✗ Capability check failed")
+                
+        except Exception as e:
+            self.current_validator = None
+            self.disable_all_operation_types("Capability check error: {}".format(e))
+            self.log_message("✗ Capability check error: {}".format(e))
+
+    def enable_operation_types_based_on_validation(self):
+        """Enable operation types based on HIOCSUPValidator results"""
+        if not self.current_validator:
+            self.disable_all_operation_types("No validation data")
+            return
+        
+        # Enable threshold operations only if HIOC_TH (fidsize == 1)
+        if self.current_validator.is_hioc_th():
+            if self.threshold_radio:
+                self.threshold_radio.configure(state="normal")
         else:
-            self.disable_parameter_set("HTT request failed on {}".format(server))
+            if self.threshold_radio:
+                self.threshold_radio.configure(state="disabled")
+                # Switch away from threshold if currently selected
+                if self.operation_var.get() == "threshold":
+                    self.operation_var.set("override_set")
+        
+        # Enable parameter set operations only if HIOC_PS (fidsize > 1)
+        if self.current_validator.supports_hiocwsup():
+            if self.parameter_set_radio:
+                self.parameter_set_radio.configure(state="normal")
+        else:
+            if self.parameter_set_radio:
+                self.parameter_set_radio.configure(state="disabled")
+                # Switch away from parameter_set if currently selected
+                if self.operation_var.get() == "parameter_set":
+                    self.operation_var.set("override_set")
+        
+        # Override, disable, enable operations are always available for any validated FID
+        # (They correspond to HIOC_BO functionality which should work regardless of FIDSize)
 
-    def check_dual_fid_capabilities(self, fid: str):
-        """
-        Check FID capabilities for dual CG1 & CG2 operation.
-        Requests HTT from CG1 first, then CG2, and validates:
-        1. Both have FIDSize > 1
-        2. FIDSize values match between CG1 and CG2  
-        3. All TH1-TH15 values match between CG1 and CG2
-        """
-        try:
-            # Check both servers are connected
-            if not (self.servers['CG1'].connected and self.servers['CG2'].connected):
-                self.disable_parameter_set("CG1 or CG2 not connected")
-                return
-            
-            cg1_info = self.servers['CG1']
-            cg2_info = self.servers['CG2']
-            
-            # Step 1: Request HTT from CG1 first
-            logger.info("Requesting HTT from CG1 for dual capability check...")
-            cg1_htt_populated = self.perform_htt_request_for_fidsize(cg1_info, fid)
-            
-            if not cg1_htt_populated:
-                self.disable_parameter_set("HTT request failed on CG1")
-                return
-            
-            # Step 2: Request HTT from CG2
-            logger.info("Requesting HTT from CG2 for dual capability check...")
-            cg2_htt_populated = self.perform_htt_request_for_fidsize(cg2_info, fid)
-            
-            if not cg2_htt_populated:
-                self.disable_parameter_set("HTT request failed on CG2")
-                return
-            
-            # Step 3: Read FIDSize from both systems
-            cg1_fidsize = self.read_fidsize(cg1_info.client, fid)
-            cg2_fidsize = self.read_fidsize(cg2_info.client, fid)
-            
-            if cg1_fidsize is None or cg2_fidsize is None:
-                self.disable_parameter_set("Failed to read FIDSize from one or both systems")
-                return
-            
-            # Step 4: Validate FIDSize > 1 for both systems
-            if cg1_fidsize <= 1 or cg2_fidsize <= 1:
-                self.disable_parameter_set("FIDSize ≤ 1 on CG1 ({}) or CG2 ({})".format(cg1_fidsize, cg2_fidsize))
-                return
-            
-            # Step 5: Validate FIDSize values match
-            if cg1_fidsize != cg2_fidsize:
-                self.disable_parameter_set("FIDSize mismatch: CG1={}, CG2={}".format(cg1_fidsize, cg2_fidsize))
-                return
-            
-            # Step 6: Read and validate HTT values match
-            cg1_htt = self.read_htt_values(cg1_info.client)
-            cg2_htt = self.read_htt_values(cg2_info.client)
-            
-            if not cg1_htt or not cg2_htt:
-                self.disable_parameter_set("Failed to read HTT values from one or both systems")
-                return
-            
-            # Step 7: Compare all TH1-TH15 values
-            htt_mismatches = []
-            for i in range(1, 16):  # 1 to 15 inclusive (TH1-TH15)
-                cg1_val = cg1_htt.get(i)
-                cg2_val = cg2_htt.get(i)
-                
-                if cg1_val != cg2_val:
-                    htt_mismatches.append("TH{}: CG1={}, CG2={}".format(i, cg1_val, cg2_val))
-            
-            if htt_mismatches:
-                mismatch_summary = "; ".join(htt_mismatches[:3])  # Show first 3 mismatches
-                if len(htt_mismatches) > 3:
-                    mismatch_summary += " (and {} more)".format(len(htt_mismatches) - 3)
-                self.disable_parameter_set("HTT mismatches: {}".format(mismatch_summary))
-                return
-            
-            # Step 8: All validations passed - enable HIOCwSUP
-            self.enable_parameter_set()
-            logger.info("Dual FID capability check passed: FIDSize={}, HTT values match - HIOCwSUP enabled".format(cg1_fidsize))
-            
-        except Exception as e:
-            logger.error("Error in dual FID capability check: {}".format(e))
-            self.disable_parameter_set("Capability check error: {}".format(e))
-
-    def perform_htt_request_for_fidsize(self, server_info: ServerConnection, fid: str) -> bool:
-        """Use HIOCOperator to perform HTT request for FIDSize capability check"""
-        try:
-            # Create progress callback that logs to the dialog
-            def capability_progress(message: str):
-                self.log_message("CAPABILITY CHECK: {}".format(message))
-            
-            # Create temporary HIOCOperator configuration for HTT request only
-            config = HIOCOperationConfig(
-                client=server_info.client,
-                controller_id=server_info.controller_id,
-                fid=fid,
-                operation_type=HIOCOperationType.THRESHOLD,  # Type doesn't matter for HTT request
-                threshold_command_code=1,  # Dummy values for HTT request
-                threshold_value=0,
-                timeout_seconds=5.0,  # Shorter timeout for capability check
-                progress_callback=capability_progress
-            )
-            
-            # Create operator and perform only HTT request step
-            temp_operator = HIOCOperator(config)
-            
-            # Use the operator's built-in HTT request method
-            htt_success = temp_operator._perform_htt_request()
-            
-            # Append the complete operation trace to the dialog log
-            operation_trace = temp_operator.get_operation_trace()
-            self.log_message("=== HTT REQUEST TRACE FOR {} ON {} ===".format(fid, server_info.name))
-            for line in operation_trace.split('\n'):
-                if line.strip():  # Skip empty lines
-                    self.log_message(line)
-            self.log_message("=== END HTT REQUEST TRACE ===")
-            
-            # Log final result
-            if htt_success:
-                logger.info("HTT populated successfully for {} on {}".format(fid, server_info.name))
-            else:
-                logger.warning("HTT request failed for {} on {}".format(fid, server_info.name))
-                # Log additional failure details from operation history
-                if temp_operator.operation_history:
-                    last_step = temp_operator.operation_history[-1]
-                    if last_step.error_message:
-                        self.log_message("FAILURE REASON: {}".format(last_step.error_message))
-                    if last_step.timeout:
-                        self.log_message("TIMEOUT: Operation timed out after {}s".format(config.timeout_seconds))
-            
-            return htt_success
-                
-        except Exception as e:
-            logger.error("Failed to perform HTT request for {} on {}: {}".format(fid, server_info.name, e))
-            self.log_message("ERROR: Failed to perform HTT request: {}".format(e))
-            return False
-
-    def read_fidsize(self, client: Client, fid: str) -> Optional[int]:
-        """Read FIDSize for a given FID from common HTT registry"""
-        try:
-            objects = client.get_objects_node()
-            # HTT is common registry, but FIDSize might be FID-specific within it
-            # Check if this should be a common FIDSize or FID-specific based on spec
-            fidsize_node = objects.get_child(["1:HTT", "1:FIDSize"])  # Common FIDSize, not FID-specific
-            fidsize = fidsize_node.get_value()
-            return fidsize
-        except Exception as e:
-            logger.error("Failed to read FIDSize for {}: {}".format(fid, e))
-            return None
-
-    def enable_parameter_set(self):
-        """Enable parameter set radio button"""
-        if self.parameter_set_radio:
-            self.parameter_set_radio.configure(state="normal")
-
-    def disable_parameter_set(self, reason: str):
-        """Disable parameter set radio button with reason"""
-        # If currently selected, switch to threshold
-        if self.operation_var.get() == "parameter_set":
-            self.operation_var.set("threshold")
-            
+    def disable_all_operation_types(self, reason: str):
+        """Disable all operation radio buttons"""
+        if self.threshold_radio:
+            self.threshold_radio.configure(state="disabled")
         if self.parameter_set_radio:
             self.parameter_set_radio.configure(state="disabled")
+            
+        # Switch to a basic operation if threshold/parameter_set was selected
+        if self.operation_var.get() in ["threshold", "parameter_set"]:
+            self.operation_var.set("override_set")
         
-        logger.info("HIOCwSUP disabled: {}".format(reason))
+        logger.info("Operation types disabled: {}".format(reason))
 
     def on_operation_change(self):
         """Handle operation type change"""
         if self.operation_var.get() == "parameter_set":
-            # Show the file frame - pack it after the operation type frame
+            # Show the file frame
             self.file_frame.pack(fill="x", padx=10, pady=5)
         else:
             # Hide the file frame
@@ -466,14 +337,12 @@ class HIOCDialog:
                 self.parsed_fidsize = fidsize
                 self.parsed_parameters = parameters
                 
-                # Enhanced status display
                 self.file_status_label.config(
-                    text="✓ Valid: FIDSize={}, {} parameters parsed for HIOCwSUP".format(
+                    text="✓ Valid: FIDSize={}, {} parameters parsed".format(
                         fidsize, len(parameters)), 
                     foreground="green"
                 )
                 
-                # Log parameter data for debugging
                 self.log_parameter_data_summary()
                 
             except Exception as e:
@@ -484,8 +353,6 @@ class HIOCDialog:
                 self.selected_file_path = None
                 self.parsed_fidsize = None
                 self.parsed_parameters = None
-                
-                # Log parsing error
                 self.log_message("CSV parsing failed: {}".format(str(e)))
 
     def validate_parameter_file(self, file_path: str) -> Tuple[int, List[int]]:
@@ -523,7 +390,6 @@ class HIOCDialog:
         if len(parameters) > 511:
             raise ValueError("Too many parameters: {} (max 511)".format(len(parameters)))
         
-        # Add validation message for SUPOperator compatibility
         self.log_message("✓ Parsed CSV: FIDSize={}, {} parameters ready for HIOCwSUP".format(
             fidsize, len(parameters)))
         
@@ -536,7 +402,7 @@ class HIOCDialog:
                 len(self.parsed_parameters) > 0)
 
     def log_parameter_data_summary(self):
-        """Log summary of current parameter data for debugging"""
+        """Log summary of current parameter data"""
         if self.is_parameter_data_ready():
             self.log_message("Parameter Data Summary:")
             self.log_message("  FIDSize: {}".format(self.parsed_fidsize))
@@ -546,8 +412,6 @@ class HIOCDialog:
             if len(self.parsed_parameters) > 3:
                 self.log_message("  Last 3 parameters: {}".format(
                     [hex(p) for p in self.parsed_parameters[-3:]]))
-        else:
-            self.log_message("No parameter data available")
 
     def log_message(self, message: str):
         """Add message to log"""
@@ -563,7 +427,7 @@ class HIOCDialog:
         self.log_message(message)
 
     def start_operation(self):
-        """Start HIOC operation"""
+        """Start HIOC operation with validation"""
         server = self.server_var.get()
         fid = self.fid_var.get()
         operation = self.operation_var.get()
@@ -576,378 +440,105 @@ class HIOCDialog:
             messagebox.showwarning("Operation in Progress", "Another operation is already in progress.")
             return
         
-        # Enhanced validation for parameter set operations
-        if operation == "parameter_set":
-            if not self.selected_file_path:
-                messagebox.showerror("File Required", "Please select a parameter file for parameter set operations.")
-                return
-            
-            if not self.is_parameter_data_ready():
-                messagebox.showerror("Data Not Ready", 
-                                   "Parameter data not properly parsed. Please reselect the CSV file.")
-                return
-            
-            # Log HIOCwSUP operation details
-            self.log_message("Starting HIOCwSUP operation:")
-            self.log_message("  Server: {}".format(server))
-            self.log_message("  FID: {}".format(fid))
-            self.log_message("  FIDSize: {}".format(self.parsed_fidsize))
-            self.log_message("  Parameters: {} values".format(len(self.parsed_parameters)))
-            self.log_message("  Flow: Nonce → CRC32 → HIOC Unlock → CTFSS → HSUP")
-        
-        # Start operation synchronously
+        # Validate using HIOCSUPValidator (fresh validation at operation start)
+        self.log_message("=== OPERATION VALIDATION ===")
         self.operation_in_progress = True
-        self.log_text.delete(1.0, tk.END)  # Clear log
         
-        if server == "CG1 & CG2":
-            self.execute_dual_operation(fid, operation)
-        else:
-            self.execute_single_operation(server, fid, operation)
-
-    def execute_single_operation(self, server: str, fid: str, operation: str):
-        """Execute operation on single server"""
         try:
-            # Validate connection before creating operator
-            server_info = self.servers[server]
-            if not server_info.connected or not server_info.client:
-                self.update_progress("{} not connected".format(server))
+            # Create fresh validator for operation
+            if server == "CG1 & CG2":
+                validator = HIOCSUPValidator(
+                    self.servers['CG1'].client,
+                    self.servers['CG2'].client,
+                    progress_callback=self.update_progress,
+                    cg1_controller_id=self.servers['CG1'].controller_id,
+                    cg2_controller_id=self.servers['CG2'].controller_id
+                )
+            else:
+                validator = HIOCSUPValidator(
+                    self.servers[server].client,
+                    progress_callback=self.update_progress,
+                    cg1_controller_id=self.servers[server].controller_id
+                )
+            
+            if not validator.validate(fid):
+                self.update_progress("✗ Operation validation failed")
                 self.operation_in_progress = False
                 return
             
-            if operation == "threshold":
-                # Need HTT values first, then show threshold selection
-                self.request_htt_and_show_threshold_selection(server, fid)
+            # Validate operation type against validation results
+            if operation == "threshold" and not validator.is_hioc_th():
+                self.update_progress("✗ Threshold operations not supported for this FID (FIDSize={})".format(validator.fidsize))
+                self.operation_in_progress = False
                 return
+            
+            if operation == "parameter_set" and not validator.supports_hiocwsup():
+                self.update_progress("✗ HIOCwSUP operations not supported for this FID (FIDSize={})".format(validator.fidsize))
+                self.operation_in_progress = False
+                return
+            
+            # Additional validation for parameter set operations
+            if operation == "parameter_set":
+                if not self.selected_file_path or not self.is_parameter_data_ready():
+                    self.update_progress("✗ Parameter file required for HIOCwSUP operations")
+                    self.operation_in_progress = False
+                    return
+            
+            self.update_progress("✓ Operation validation successful - proceeding...")
+            
+            # Clear log and start operation
+            self.log_text.delete(1.0, tk.END)
+            
+            # Execute operation based on type
+            if operation == "threshold":
+                self.execute_threshold_operation(server, fid, validator)
             elif operation == "parameter_set":
-                # Use new clean SUP operation flow
                 self.execute_sup_operation(server, fid)
             else:
-                # Use HIOCOperator for other operations
                 self.execute_hioc_operation(server, fid, operation)
                 
         except Exception as e:
-            self.update_progress("Error: {}".format(e))
+            self.update_progress("✗ Operation error: {}".format(e))
             self.operation_in_progress = False
 
-    def execute_sup_operation(self, server: str, fid: str):
-        """Execute SUP operation using the clean 3-step flow"""
-        server_info = self.servers[server]
-        
-        # Validate connection
-        if not server_info.connected or not server_info.client:
-            self.update_progress("{} not connected".format(server))
-            self.operation_in_progress = False
-            return
-        
-        # Validate parsed parameter data is available
-        if self.parsed_fidsize is None or self.parsed_parameters is None:
-            self.update_progress("Parameter file not properly parsed")
-            self.operation_in_progress = False
-            return
-        
-        try:
-            # Step 1: Request nonce using SUPOperator
-            self.update_progress("Step 1: Requesting nonce...")
-            
-            sup_config_nonce = SUPOperationConfig(
-                client=server_info.client,
-                controller_id=server_info.controller_id,
-                fid=fid,
-                parameters=self.parsed_parameters,
-                progress_callback=self.update_progress
-            )
-            
-            sup_operator_nonce = SUPOperator(sup_config_nonce)
-            nonce_success = sup_operator_nonce.request_nonce()
-            
-            if not nonce_success:
-                self.update_progress("✗ Nonce request failed")
-                self.log_message(sup_operator_nonce.get_abort_analysis())
-                self.operation_in_progress = False
-                return
-            
-            # Step 2: Calculate CRC32
-            self.update_progress("Step 2: Calculating CRC32...")
-            crc32_success = sup_operator_nonce.calculate_crc32()
-            
-            if not crc32_success:
-                self.update_progress("✗ CRC32 calculation failed")
-                self.operation_in_progress = False
-                return
-            
-            crc32_value = sup_operator_nonce.crc32_value
-            
-            # Step 3: HIOC unlock using HIOCwSUPOperator
-            self.update_progress("Step 3: HIOC unlock sequence...")
-            
-            hioc_config = HIOCOperationConfig(
-                client=server_info.client,
-                controller_id=server_info.controller_id,
-                fid=fid,
-                operation_type=HIOCOperationType.THRESHOLD,  # Placeholder type
-                threshold_command_code=50,  # Unlock command
-                threshold_value=crc32_value,
-                progress_callback=self.update_progress
-            )
-            
-            hiocwsup_operator = HIOCwSUPOperator(hioc_config)
-            unlock_success = hiocwsup_operator.perform_unlock_sequence(crc32_value)
-            
-            if not unlock_success:
-                self.update_progress("✗ HIOC unlock failed")
-                self.log_message(hiocwsup_operator.get_abort_analysis())
-                self.operation_in_progress = False
-                return
-            
-            # Step 4: SUP operation (CTFSS + HSUP)
-            self.update_progress("Step 4: SUP sequence...")
-            
-            sup_config_final = SUPOperationConfig(
-                client=server_info.client,
-                controller_id=server_info.controller_id,
-                fid=fid,
-                parameters=self.parsed_parameters,
-                nonce=sup_operator_nonce.nonce_value,
-                progress_callback=self.update_progress
-            )
-            
-            sup_operator_final = SUPOperator(sup_config_final)
-            sup_success = sup_operator_final.execute_operation()
-            
-            # Show results
-            if sup_success:
-                self.update_progress("✓ HIOCwSUP operation completed successfully")
-            else:
-                self.update_progress("✗ SUP operation failed")
-                self.log_message(sup_operator_final.get_abort_analysis())
-            
-        except Exception as e:
-            self.update_progress("✗ HIOCwSUP operation error: {}".format(e))
-        
-        self.operation_in_progress = False
-
-    def execute_dual_operation(self, fid: str, operation: str):
-        """Execute operation on both CG1 and CG2"""
-        try:
-            # First validate compatibility
-            self.update_progress("Validating dual operation compatibility...")
-            
-            cg1_client = self.servers['CG1'].client
-            cg2_client = self.servers['CG2'].client
-            
-            # Validate both clients are available
-            if not cg1_client or not cg2_client:
-                self.update_progress("CG1 or CG2 client not available")
-                self.operation_in_progress = False
-                return
-            
-            self.validator = HIOCSUPValidator(cg1_client, cg2_client)
-            validation_results = self.validator.validate_for_dual_hioc_operation(fid if operation == "parameter_set" else None)
-            
-            if not validation_results['overall_success']:
-                error_summary = self.validator.get_validation_summary(validation_results)
-                self.update_progress("Validation failed:")
-                self.log_message(error_summary)
-                self.operation_in_progress = False
-                return
-            
-            self.update_progress("✓ Validation passed - proceeding with dual operation")
-            
-            if operation == "threshold":
-                # For thresholds, we already have HTT values from validation
-                htt_result = validation_results['htt_comparison']
-                self.htt_values = htt_result.cg1_htt  # Both are same due to validation
-                self.show_threshold_selection_dual(fid, operation)
-            elif operation == "parameter_set":
-                # Execute SUP operation on both systems
-                self.execute_dual_sup_operation(fid)
-            else:
-                # Execute HIOC operation on both systems  
-                self.execute_dual_hioc_operation(fid, operation)
-                
-        except Exception as e:
-            self.update_progress("Dual operation error: {}".format(e))
-            self.operation_in_progress = False
-
-    def execute_dual_sup_operation(self, fid: str):
-        """Execute SUP operation on both CG1 and CG2 (CG1 first, then CG2 if CG1 succeeds)"""
-        try:
-            # Execute on CG1 first
-            self.update_progress("Starting CG1 HIOCwSUP operation...")
-            
-            cg1_success = self.execute_single_sup_operation_sync('CG1', fid)
-            
-            if cg1_success:
-                self.update_progress("✓ CG1 HIOCwSUP completed - Starting CG2 HIOCwSUP operation...")
-                
-                # Execute on CG2 automatically since CG1 succeeded
-                cg2_success = self.execute_single_sup_operation_sync('CG2', fid)
-                
-                if cg2_success:
-                    self.update_progress("✓ Both CG1 and CG2 HIOCwSUP operations completed successfully")
-                else:
-                    self.update_progress("✗ CG2 HIOCwSUP operation failed")
-            else:
-                self.update_progress("✗ CG1 HIOCwSUP operation failed - CG2 operation cancelled")
-                
-        except Exception as e:
-            self.update_progress("Dual HIOCwSUP operation error: {}".format(e))
-            
-        self.operation_in_progress = False
-
-    def execute_single_sup_operation_sync(self, server: str, fid: str) -> bool:
-        """Execute SUP operation synchronously and return success status"""
-        server_info = self.servers[server]
-        
-        # Validate connection
-        if not server_info.connected or not server_info.client:
-            self.update_progress("{}: Not connected".format(server))
-            return False
-        
-        # Validate parsed parameter data is available
-        if self.parsed_fidsize is None or self.parsed_parameters is None:
-            self.update_progress("{}: Parameter data not available".format(server))
-            return False
-        
-        try:
-            # Step 1: Request nonce using SUPOperator
-            self.update_progress("{}: Requesting nonce...".format(server))
-            
-            sup_config_nonce = SUPOperationConfig(
-                client=server_info.client,
-                controller_id=server_info.controller_id,
-                fid=fid,
-                parameters=self.parsed_parameters,
-                progress_callback=lambda msg: self.update_progress("{}: {}".format(server, msg))
-            )
-            
-            sup_operator_nonce = SUPOperator(sup_config_nonce)
-            nonce_success = sup_operator_nonce.request_nonce()
-            
-            if not nonce_success:
-                self.update_progress("{}: Nonce request failed".format(server))
-                self.log_message("--- {} NONCE ABORT ANALYSIS ---".format(server))
-                self.log_message(sup_operator_nonce.get_abort_analysis())
-                return False
-            
-            # Step 2: Calculate CRC32
-            self.update_progress("{}: Calculating CRC32...".format(server))
-            crc32_success = sup_operator_nonce.calculate_crc32()
-            
-            if not crc32_success:
-                self.update_progress("{}: CRC32 calculation failed".format(server))
-                return False
-            
-            crc32_value = sup_operator_nonce.crc32_value
-            
-            # Step 3: HIOC unlock using HIOCwSUPOperator
-            self.update_progress("{}: HIOC unlock sequence...".format(server))
-            
-            hioc_config = HIOCOperationConfig(
-                client=server_info.client,
-                controller_id=server_info.controller_id,
-                fid=fid,
-                operation_type=HIOCOperationType.THRESHOLD,  # Placeholder type
-                threshold_command_code=50,  # Unlock command
-                threshold_value=crc32_value,
-                progress_callback=lambda msg: self.update_progress("{}: {}".format(server, msg))
-            )
-            
-            hiocwsup_operator = HIOCwSUPOperator(hioc_config)
-            unlock_success = hiocwsup_operator.perform_unlock_sequence(crc32_value)
-            
-            if not unlock_success:
-                self.update_progress("{}: HIOC unlock failed".format(server))
-                self.log_message("--- {} HIOC UNLOCK ABORT ANALYSIS ---".format(server))
-                self.log_message(hiocwsup_operator.get_abort_analysis())
-                return False
-            
-            # Step 4: SUP operation (CTFSS + HSUP)
-            self.update_progress("{}: SUP sequence...".format(server))
-            
-            sup_config_final = SUPOperationConfig(
-                client=server_info.client,
-                controller_id=server_info.controller_id,
-                fid=fid,
-                parameters=self.parsed_parameters,
-                nonce=sup_operator_nonce.nonce_value,
-                progress_callback=lambda msg: self.update_progress("{}: {}".format(server, msg))
-            )
-            
-            sup_operator_final = SUPOperator(sup_config_final)
-            sup_success = sup_operator_final.execute_operation()
-            
-            # Show results
-            if sup_success:
-                self.update_progress("✓ {} HIOCwSUP operation completed successfully".format(server))
-                return True
-            else:
-                self.update_progress("✗ {} SUP operation failed".format(server))
-                self.log_message("--- {} SUP ABORT ANALYSIS ---".format(server))
-                self.log_message(sup_operator_final.get_abort_analysis())
-                return False
-            
-        except Exception as e:
-            self.update_progress("✗ {} HIOCwSUP operation error: {}".format(server, e))
-            return False
-
-    def request_htt_and_show_threshold_selection(self, server: str, fid: str):
-        """Request HTT values using HIOCOperator and show threshold selection"""
-        # Get connected client from server info
-        server_info = self.servers[server]
-        if not server_info.connected or not server_info.client:
-            self.update_progress("Server not connected")
-            self.operation_in_progress = False
-            return
-        
-        # Use HIOCOperator to perform HTT request
-        htt_populated = self.perform_htt_request_for_fidsize(server_info, fid)
-        
-        if htt_populated:
-            # Read the populated HTT values
-            htt_values = self.read_htt_values(server_info.client)
-            if htt_values:
-                self.htt_values = htt_values
-                self.show_threshold_selection(server, fid, htt_values)
-            else:
-                self.update_progress("Failed to read HTT values")
-                self.operation_in_progress = False
+    def execute_threshold_operation(self, server: str, fid: str, validator: HIOCSUPValidator):
+        """Execute threshold operation with validated HTT values"""
+        if server == "CG1 & CG2":
+            self.show_threshold_selection_dual(fid, validator.th_val_array)
         else:
-            self.update_progress("HTT request failed")
-            self.operation_in_progress = False
+            self.show_threshold_selection_single(server, fid, validator.th_val_array)
 
-    def read_htt_values(self, client: Client) -> Optional[Dict[int, Any]]:
-        """Read HTT threshold values from a server"""
-        try:
-            objects = client.get_objects_node()
-            htt_values = {}
-            
-            for i in range(1, 16):  # 1 to 15 inclusive (TH1-TH15)
-                try:
-                    htt_node = objects.get_child(["1:HTT", "1:TH{}".format(i)])
-                    value = htt_node.get_value()
-                    htt_values[i] = value
-                except Exception as e:
-                    logger.warning("Failed to read TH{}: {}".format(i, e))
-                    htt_values[i] = None
-            
-            return htt_values
-            
-        except Exception as e:
-            logger.error("Failed to read HTT values: {}".format(e))
-            return None
+    def show_threshold_selection_single(self, server: str, fid: str, htt_values: Dict[int, Any]):
+        """Show threshold selection for single server"""
+        self.show_threshold_selection_dialog(
+            title="Select Threshold - {} {}".format(server, fid),
+            htt_values=htt_values,
+            callback=lambda cc, value: self.continue_single_threshold_operation(server, fid, cc, value)
+        )
 
-    def show_threshold_selection(self, server: str, fid: str, htt_values: Dict[int, Any]):
-        """Show threshold selection dialog with listbox"""
-        # Create threshold selection dialog
+    def show_threshold_selection_dual(self, fid: str, htt_values: Dict[int, Any]):
+        """Show threshold selection for dual operation"""
+        self.show_threshold_selection_dialog(
+            title="Select Threshold - CG1 & CG2 {}".format(fid),
+            htt_values=htt_values,
+            callback=lambda cc, value: self.continue_dual_threshold_operation(fid, cc, value),
+            subtitle="(HTT values verified equivalent between systems)"
+        )
+
+    def show_threshold_selection_dialog(self, title: str, htt_values: Dict[int, Any], 
+                                      callback: Callable, subtitle: str = None):
+        """Generic threshold selection dialog"""
         selection_dialog = tk.Toplevel(self.dialog)
-        selection_dialog.title("Select Threshold - {} {}".format(server, fid))
+        selection_dialog.title(title)
         selection_dialog.geometry("400x500")
         selection_dialog.grab_set()
         
-        ttk.Label(selection_dialog, 
-                 text="Select threshold to modify on {} {}:".format(server, fid),
+        ttk.Label(selection_dialog, text=title + ":", 
                  font=('TkDefaultFont', 10, 'bold')).pack(pady=10)
+        
+        if subtitle:
+            ttk.Label(selection_dialog, text=subtitle,
+                     font=('TkDefaultFont', 8), foreground="green").pack(pady=5)
         
         # Create listbox with scrollbar
         list_frame = ttk.Frame(selection_dialog)
@@ -983,11 +574,8 @@ class HIOCDialog:
                                          "Threshold {} has no valid value (N/A)".format(cc))
                     return
                 
-                self.selected_threshold = (cc, value)
                 selection_dialog.destroy()
-                
-                # Continue with threshold operation
-                self.dialog.after(0, self.continue_threshold_operation, server, fid, cc)
+                callback(cc, value)
             else:
                 messagebox.showwarning("Selection Required", "Please select a threshold.")
         
@@ -1003,158 +591,44 @@ class HIOCDialog:
         ttk.Button(button_frame, text="Select", command=on_threshold_select).pack(side="left", padx=5)
         ttk.Button(button_frame, text="Cancel", command=on_threshold_cancel).pack(side="left", padx=5)
 
-    def show_threshold_selection_dual(self, fid: str, operation: str):
-        """Show threshold selection for dual operation (HTTs already validated as equivalent)"""
-        if not self.htt_values:
-            self.dialog.after(0, self.update_progress, "No HTT values available for dual operation")
-            self.operation_in_progress = False
-            return
-        
-        # Create threshold selection dialog for dual operation
-        selection_dialog = tk.Toplevel(self.dialog)
-        selection_dialog.title("Select Threshold - CG1 & CG2 {}".format(fid))
-        selection_dialog.geometry("400x500")
-        selection_dialog.grab_set()
-        
-        ttk.Label(selection_dialog, 
-                 text="Select threshold to modify on both CG1 & CG2 {}:".format(fid),
-                 font=('TkDefaultFont', 10, 'bold')).pack(pady=10)
-        
-        ttk.Label(selection_dialog, 
-                 text="(HTT values verified equivalent between systems)",
-                 font=('TkDefaultFont', 8), foreground="green").pack(pady=5)
-        
-        # Create listbox with scrollbar
-        list_frame = ttk.Frame(selection_dialog)
-        list_frame.pack(pady=10, padx=20, fill="both", expand=True)
-        
-        listbox = tk.Listbox(list_frame, width=60, height=15, font=('TkDefaultFont', 9))
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
-        listbox.configure(yscrollcommand=scrollbar.set)
-        
-        listbox.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        
-        # Populate listbox with CC:Value pairs
-        threshold_map = {}
-        for i in range(1, 16):  # 1 to 15 inclusive (TH1-TH15)
-            cc = i  # Command Code = threshold number
-            value = self.htt_values.get(i, "N/A")
-            
-            if value is not None and value != "N/A":
-                display_text = "CC={:2d} (TH{}): {}".format(cc, i, value)
-            else:
-                display_text = "CC={:2d} (TH{}): N/A".format(cc, i)
-            
-            listbox.insert(tk.END, display_text)
-            threshold_map[i-1] = (cc, value)  # Map listbox index to (CC, Value)
-        
-        def on_dual_threshold_select():
-            selection = listbox.curselection()
-            if selection:
-                cc, value = threshold_map[selection[0]]
-                if value is None or value == "N/A":
-                    messagebox.showwarning("Invalid Selection", 
-                                         "Threshold {} has no valid value (N/A)".format(cc))
-                    return
-                
-                self.selected_threshold = (cc, value)
-                selection_dialog.destroy()
-                
-                # Continue with dual threshold operation
-                self.dialog.after(0, self.continue_dual_threshold_operation, fid, cc)
-            else:
-                messagebox.showwarning("Selection Required", "Please select a threshold.")
-        
-        def on_dual_threshold_cancel():
-            selection_dialog.destroy()
-            self.update_progress("Dual threshold selection cancelled")
-            self.operation_in_progress = False
-        
-        # Button frame
-        button_frame = ttk.Frame(selection_dialog)
-        button_frame.pack(pady=10)
-        
-        ttk.Button(button_frame, text="Select", command=on_dual_threshold_select).pack(side="left", padx=5)
-        ttk.Button(button_frame, text="Cancel", command=on_dual_threshold_cancel).pack(side="left", padx=5)
-
-    def continue_threshold_operation(self, server: str, fid: str, threshold_cc: int):
-        """Continue with threshold operation after selection"""
-        self.execute_threshold_operation(server, fid, threshold_cc)
-
-    def continue_dual_threshold_operation(self, fid: str, threshold_cc: int):
-        """Continue with dual threshold operation after selection"""
-        self.execute_dual_threshold_operation(fid, threshold_cc)
-
-    def execute_threshold_operation(self, server: str, fid: str, threshold_cc: int):
-        """Execute threshold operation using HIOCOperator"""
+    def continue_single_threshold_operation(self, server: str, fid: str, threshold_cc: int, threshold_value: Any):
+        """Continue with single server threshold operation"""
         server_info = self.servers[server]
         
-        # Validate connection
-        if not server_info.connected or not server_info.client:
-            self.update_progress("{} not connected".format(server))
-            self.operation_in_progress = False
-            return
-        
-        # Get the actual threshold value from HTT
-        threshold_value = self.htt_values.get(threshold_cc) if self.htt_values else None
-        if threshold_value is None:
-            self.update_progress("Threshold value not available for CC={}".format(threshold_cc))
-            self.operation_in_progress = False
-            return
-        
-        # Create HIOCOperator configuration for threshold with both CC and value
         config = HIOCOperationConfig(
-            client=server_info.client,  # Use existing connection
+            client=server_info.client,
             controller_id=server_info.controller_id,
             fid=fid,
             operation_type=HIOCOperationType.THRESHOLD,
-            threshold_command_code=threshold_cc,  # CC (1-15) selected by user
-            threshold_value=threshold_value,      # Actual threshold value from HTT
+            threshold_command_code=threshold_cc,
+            threshold_value=threshold_value,
             progress_callback=self.update_progress
         )
         
-        # Execute operation
         operator = HIOCOperator(config)
         success = operator.execute_operation()
         
-        # Show results
         if success:
             self.update_progress("✓ Threshold operation completed successfully")
         else:
             self.update_progress("✗ Threshold operation failed")
-            abort_analysis = operator.get_abort_analysis()
-            self.log_message("--- ABORT ANALYSIS ---")
-            self.log_message(abort_analysis)
+            self.log_message(operator.get_abort_analysis())
         
         self.operation_in_progress = False
 
-    def execute_dual_threshold_operation(self, fid: str, threshold_cc: int):
-        """Execute threshold operation on both CG1 and CG2 (CG1 first, then CG2 if CG1 succeeds)"""
+    def continue_dual_threshold_operation(self, fid: str, threshold_cc: int, threshold_value: Any):
+        """Continue with dual server threshold operation"""
         try:
-            # Get the actual threshold value from HTT
-            threshold_value = self.htt_values.get(threshold_cc) if self.htt_values else None
-            if threshold_value is None:
-                self.update_progress("Threshold value not available for CC={}".format(threshold_cc))
-                self.operation_in_progress = False
-                return
-            
             # Execute on CG1 first
             self.update_progress("Starting CG1 threshold operation...")
             
-            cg1_server_info = self.servers['CG1']
-            if not cg1_server_info.connected or not cg1_server_info.client:
-                self.update_progress("CG1 not connected")
-                self.operation_in_progress = False
-                return
-            
             cg1_config = HIOCOperationConfig(
-                client=cg1_server_info.client,  # Use existing connection
-                controller_id=cg1_server_info.controller_id,
+                client=self.servers['CG1'].client,
+                controller_id=self.servers['CG1'].controller_id,
                 fid=fid,
                 operation_type=HIOCOperationType.THRESHOLD,
-                threshold_command_code=threshold_cc,  # CC (1-15) selected by user
-                threshold_value=threshold_value,      # Actual threshold value from HTT
+                threshold_command_code=threshold_cc,
+                threshold_value=threshold_value,
                 progress_callback=lambda msg: self.update_progress("CG1: {}".format(msg))
             )
             
@@ -1162,22 +636,15 @@ class HIOCDialog:
             cg1_success = cg1_operator.execute_operation()
             
             if cg1_success:
-                self.update_progress("✓ CG1 threshold operation completed - Starting CG2...")
-                
-                # Execute on CG2 automatically since CG1 succeeded
-                cg2_server_info = self.servers['CG2']
-                if not cg2_server_info.connected or not cg2_server_info.client:
-                    self.update_progress("CG2 not connected")
-                    self.operation_in_progress = False
-                    return
+                self.update_progress("✓ CG1 completed - Starting CG2...")
                 
                 cg2_config = HIOCOperationConfig(
-                    client=cg2_server_info.client,  # Use existing connection
-                    controller_id=cg2_server_info.controller_id,
+                    client=self.servers['CG2'].client,
+                    controller_id=self.servers['CG2'].controller_id,
                     fid=fid,
                     operation_type=HIOCOperationType.THRESHOLD,
-                    threshold_command_code=threshold_cc,  # CC (1-15) selected by user
-                    threshold_value=threshold_value,      # Actual threshold value from HTT
+                    threshold_command_code=threshold_cc,
+                    threshold_value=threshold_value,
                     progress_callback=lambda msg: self.update_progress("CG2: {}".format(msg))
                 )
                 
@@ -1188,80 +655,187 @@ class HIOCDialog:
                     self.update_progress("✓ Both CG1 and CG2 threshold operations completed successfully")
                 else:
                     self.update_progress("✗ CG2 threshold operation failed")
-                    abort_analysis = cg2_operator.get_abort_analysis()
                     self.log_message("--- CG2 ABORT ANALYSIS ---")
-                    self.log_message(abort_analysis)
-                    
+                    self.log_message(cg2_operator.get_abort_analysis())
             else:
-                self.update_progress("✗ CG1 threshold operation failed - CG2 operation cancelled")
-                abort_analysis = cg1_operator.get_abort_analysis()
+                self.update_progress("✗ CG1 threshold operation failed - CG2 cancelled")
                 self.log_message("--- CG1 ABORT ANALYSIS ---")
-                self.log_message(abort_analysis)
+                self.log_message(cg1_operator.get_abort_analysis())
                 
         except Exception as e:
-            self.update_progress("Dual threshold operation error: {}".format(e))
+            self.update_progress("✗ Dual threshold operation error: {}".format(e))
             
         self.operation_in_progress = False
 
-    def execute_hioc_operation(self, server: str, fid: str, operation: str):
-        """Execute HIOC operation using HIOCOperator"""
+    def execute_sup_operation(self, server: str, fid: str):
+        """Execute SUP operation (single or dual)"""
+        if server == "CG1 & CG2":
+            self.execute_dual_sup_operation(fid)
+        else:
+            self.execute_single_sup_operation(server, fid)
+
+    def execute_single_sup_operation(self, server: str, fid: str):
+        """Execute SUP operation on single server"""
+        try:
+            success = self.execute_single_sup_operation_sync(server, fid)
+            
+            if success:
+                self.update_progress("✓ {} HIOCwSUP operation completed successfully".format(server))
+            else:
+                self.update_progress("✗ {} HIOCwSUP operation failed".format(server))
+                
+        except Exception as e:
+            self.update_progress("✗ {} HIOCwSUP operation error: {}".format(server, e))
+            
+        self.operation_in_progress = False
+
+    def execute_dual_sup_operation(self, fid: str):
+        """Execute SUP operation on both CG1 and CG2"""
+        try:
+            # Execute on CG1 first
+            self.update_progress("Starting CG1 HIOCwSUP operation...")
+            cg1_success = self.execute_single_sup_operation_sync('CG1', fid)
+            
+            if cg1_success:
+                self.update_progress("✓ CG1 completed - Starting CG2 HIOCwSUP operation...")
+                cg2_success = self.execute_single_sup_operation_sync('CG2', fid)
+                
+                if cg2_success:
+                    self.update_progress("✓ Both CG1 and CG2 HIOCwSUP operations completed successfully")
+                else:
+                    self.update_progress("✗ CG2 HIOCwSUP operation failed")
+            else:
+                self.update_progress("✗ CG1 HIOCwSUP operation failed - CG2 cancelled")
+                
+        except Exception as e:
+            self.update_progress("✗ Dual HIOCwSUP operation error: {}".format(e))
+            
+        self.operation_in_progress = False
+
+    def execute_single_sup_operation_sync(self, server: str, fid: str) -> bool:
+        """Execute SUP operation synchronously and return success status"""
         server_info = self.servers[server]
         
-        # Validate connection
         if not server_info.connected or not server_info.client:
-            self.update_progress("{} not connected".format(server))
-            self.operation_in_progress = False
-            return
+            self.update_progress("{}: Not connected".format(server))
+            return False
         
-        # Map dialog operation to HIOCOperationType
-        operation_mapping = {
-            "override_set": HIOCOperationType.OVERRIDE_SET,
-            "override_unset": HIOCOperationType.OVERRIDE_UNSET,
-            "disable": HIOCOperationType.DISABLE,
-            "enable": HIOCOperationType.ENABLE
-        }
+        if not self.is_parameter_data_ready():
+            self.update_progress("{}: Parameter data not available".format(server))
+            return False
         
-        hioc_operation = operation_mapping.get(operation)
-        if not hioc_operation:
-            self.update_progress("Invalid HIOC operation: {}".format(operation))
-            self.operation_in_progress = False
-            return
-        
-        # Create HIOCOperator configuration with connected client
-        config = HIOCOperationConfig(
-            client=server_info.client,  # Use existing connection
-            controller_id=server_info.controller_id,
-            fid=fid,
-            operation_type=hioc_operation,
-            progress_callback=self.update_progress
-        )
-        
-        # Execute operation
-        operator = HIOCOperator(config)
-        success = operator.execute_operation()
-        
-        # Show results
-        if success:
-            self.update_progress("✓ Operation completed successfully")
+        try:
+            # Step 1: Request nonce
+            self.update_progress("{}: Requesting nonce...".format(server))
+            
+            sup_config_nonce = SUPOperationConfig(
+                client=server_info.client,
+                controller_id=server_info.controller_id,
+                fid=fid,
+                parameters=self.parsed_parameters,
+                progress_callback=lambda msg: self.update_progress("{}: {}".format(server, msg))
+            )
+            
+            sup_operator_nonce = SUPOperator(sup_config_nonce)
+            nonce_success = sup_operator_nonce.request_nonce()
+            
+            if not nonce_success:
+                self.update_progress("{}: Nonce request failed".format(server))
+                self.log_message("--- {} NONCE ABORT ANALYSIS ---".format(server))
+                self.log_message(sup_operator_nonce.get_abort_analysis())
+                return False
+            
+            # Step 2: Calculate CRC32
+            self.update_progress("{}: Calculating CRC32...".format(server))
+            crc32_success = sup_operator_nonce.calculate_crc32()
+            
+            if not crc32_success:
+                self.update_progress("{}: CRC32 calculation failed".format(server))
+                return False
+            
+            crc32_value = sup_operator_nonce.crc32_value
+            
+            # Step 3: HIOC unlock
+            self.update_progress("{}: HIOC unlock sequence...".format(server))
+            
+            hioc_config = HIOCOperationConfig(
+                client=server_info.client,
+                controller_id=server_info.controller_id,
+                fid=fid,
+                operation_type=HIOCOperationType.THRESHOLD,  # Placeholder
+                threshold_command_code=50,  # Unlock command
+                threshold_value=crc32_value,
+                progress_callback=lambda msg: self.update_progress("{}: {}".format(server, msg))
+            )
+            
+            hiocwsup_operator = HIOCwSUPOperator(hioc_config)
+            unlock_success = hiocwsup_operator.perform_unlock_sequence(crc32_value)
+            
+            if not unlock_success:
+                self.update_progress("{}: HIOC unlock failed".format(server))
+                self.log_message("--- {} HIOC UNLOCK ABORT ANALYSIS ---".format(server))
+                self.log_message(hiocwsup_operator.get_abort_analysis())
+                return False
+            
+            # Step 4: SUP operation
+            self.update_progress("{}: SUP sequence...".format(server))
+            
+            sup_config_final = SUPOperationConfig(
+                client=server_info.client,
+                controller_id=server_info.controller_id,
+                fid=fid,
+                parameters=self.parsed_parameters,
+                nonce=sup_operator_nonce.nonce_value,
+                progress_callback=lambda msg: self.update_progress("{}: {}".format(server, msg))
+            )
+            
+            sup_operator_final = SUPOperator(sup_config_final)
+            sup_success = sup_operator_final.execute_operation()
+            
+            if sup_success:
+                self.update_progress("✓ {} HIOCwSUP operation completed successfully".format(server))
+                return True
+            else:
+                self.update_progress("✗ {} SUP operation failed".format(server))
+                self.log_message("--- {} SUP ABORT ANALYSIS ---".format(server))
+                self.log_message(sup_operator_final.get_abort_analysis())
+                return False
+                
+        except Exception as e:
+            self.update_progress("✗ {} HIOCwSUP operation error: {}".format(server, e))
+            return False
+
+    def execute_hioc_operation(self, server: str, fid: str, operation: str):
+        """Execute standard HIOC operation (single or dual)"""
+        if server == "CG1 & CG2":
+            self.execute_dual_hioc_operation(fid, operation)
         else:
-            self.update_progress("✗ Operation failed")
-            abort_analysis = operator.get_abort_analysis()
-            self.log_message(abort_analysis)
-        
+            self.execute_single_hioc_operation(server, fid, operation)
+
+    def execute_single_hioc_operation(self, server: str, fid: str, operation: str):
+        """Execute HIOC operation on single server"""
+        try:
+            success = self.execute_single_hioc_operation_sync(server, fid, operation)
+            
+            if success:
+                self.update_progress("✓ {} operation completed successfully".format(server))
+            else:
+                self.update_progress("✗ {} operation failed".format(server))
+                
+        except Exception as e:
+            self.update_progress("✗ {} operation error: {}".format(server, e))
+            
         self.operation_in_progress = False
 
     def execute_dual_hioc_operation(self, fid: str, operation: str):
-        """Execute HIOC operation on both CG1 and CG2 (CG1 first, then CG2 if CG1 succeeds)"""
+        """Execute HIOC operation on both CG1 and CG2"""
         try:
             # Execute on CG1 first
             self.update_progress("Starting CG1 operation...")
-            
             cg1_success = self.execute_single_hioc_operation_sync('CG1', fid, operation)
             
             if cg1_success:
                 self.update_progress("✓ CG1 completed - Starting CG2 operation...")
-                
-                # Execute on CG2 automatically since CG1 succeeded
                 cg2_success = self.execute_single_hioc_operation_sync('CG2', fid, operation)
                 
                 if cg2_success:
@@ -1269,10 +843,10 @@ class HIOCDialog:
                 else:
                     self.update_progress("✗ CG2 operation failed")
             else:
-                self.update_progress("✗ CG1 operation failed - CG2 operation cancelled")
+                self.update_progress("✗ CG1 operation failed - CG2 cancelled")
                 
         except Exception as e:
-            self.update_progress("Dual HIOC operation error: {}".format(e))
+            self.update_progress("✗ Dual operation error: {}".format(e))
             
         self.operation_in_progress = False
 
@@ -1280,7 +854,6 @@ class HIOCDialog:
         """Execute HIOC operation synchronously and return success status"""
         server_info = self.servers[server]
         
-        # Validate connection
         if not server_info.connected or not server_info.client:
             self.update_progress("{}: Not connected".format(server))
             return False
@@ -1295,12 +868,12 @@ class HIOCDialog:
         
         hioc_operation = operation_mapping.get(operation)
         if not hioc_operation:
-            self.update_progress("{}: Invalid HIOC operation: {}".format(server, operation))
+            self.update_progress("{}: Invalid operation: {}".format(server, operation))
             return False
         
-        # Create HIOCOperator configuration with connected client
+        # Create HIOCOperator configuration
         config = HIOCOperationConfig(
-            client=server_info.client,  # Use existing connection
+            client=server_info.client,
             controller_id=server_info.controller_id,
             fid=fid,
             operation_type=hioc_operation,
@@ -1311,14 +884,12 @@ class HIOCDialog:
         operator = HIOCOperator(config)
         success = operator.execute_operation()
         
-        # Show results
         if success:
             self.update_progress("✓ {} operation completed successfully".format(server))
         else:
             self.update_progress("✗ {} operation failed".format(server))
-            abort_analysis = operator.get_abort_analysis()
             self.log_message("--- {} ABORT ANALYSIS ---".format(server))
-            self.log_message(abort_analysis)
+            self.log_message(operator.get_abort_analysis())
         
         return success
 
@@ -1378,7 +949,6 @@ def create_hioc_dialog(parent, servers: Dict[str, ServerConnection]):
         raise ValueError("HIOC operations require CG1 and/or CG2 server connections")
     
     # Create and return the dialog instance
-    # The dialog will handle its own initialization and widget creation
     dialog = HIOCDialog(parent, servers)
     
     return dialog

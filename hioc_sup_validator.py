@@ -1,93 +1,233 @@
 """
-HIOC/SUP Validation Class
-Handles HIOC and HIOCwSUP configuration validation between CG1 and CG2 systems.
-Independent of COS/PSOS operational states.
+HIOC SUP Validator
+Updated to use HIOCOperator for HTT requests instead of duplicating functionality.
+Provides validation for single and dual server operations with proper logging.
 """
 
-from typing import Dict, List, Optional, Tuple, Any
-from enum import Enum
+from typing import Optional, Dict, Any, Callable, Tuple
 from opcua import Client
 import logging
+
+# Import HIOCOperator for HTT requests
+from hioc_operator import HIOCOperator, HIOCOperationConfig, HIOCOperationType
 
 logger = logging.getLogger(__name__)
 
 
-class ValidationResult(Enum):
-    """Validation result types"""
-    SUCCESS = "success"
-    MISMATCH = "mismatch"
-    ERROR = "error"
-    MISSING_DATA = "missing_data"
-
-
-class HTTComparisonResult:
-    """Result of HTT threshold table comparison"""
-    def __init__(self, result: ValidationResult, mismatches: List[str] = None, 
-                 cg1_htt: Dict[int, Any] = None, cg2_htt: Dict[int, Any] = None, 
-                 error_message: Optional[str] = None):
-        self.result = result
-        self.mismatches = mismatches
-        self.cg1_htt = cg1_htt
-        self.cg2_htt = cg2_htt
-        self.error_message = error_message
-
-
-class FIDSizeComparisonResult:
-    """Result of FIDSize comparison for HIOCwSUP capability"""
-    def __init__(self, result: ValidationResult, fid: str, cg1_fidsize: Optional[int] = None, 
-                 cg2_fidsize: Optional[int] = None, both_support_sup: bool = False, 
-                 error_message: Optional[str] = None):
-        self.result = result
-        self.fid = fid
-        self.cg1_fidsize = cg1_fidsize
-        self.cg2_fidsize = cg2_fidsize
-        self.both_support_sup = both_support_sup
-        self.error_message = error_message
-
-
-class ControllerIDValidationResult:
-    """Result of controller ID validation"""
-    def __init__(self, result: ValidationResult, cg1_expected: int = 1464099, 
-                 cg2_expected: int = 1464098, cg1_actual: Optional[int] = None, 
-                 cg2_actual: Optional[int] = None, error_message: Optional[str] = None):
-        self.result = result
-        self.cg1_expected = cg1_expected
-        self.cg2_expected = cg2_expected
-        self.cg1_actual = cg1_actual
-        self.cg2_actual = cg2_actual
-        self.error_message = error_message
-
-
 class HIOCSUPValidator:
     """
-    Handles HIOC and HIOCwSUP configuration validation between CG1 and CG2 systems.
-    Focuses on parameter configuration compatibility, independent of operational states.
+    Validates HIOC/SUP operations using HIOCOperator for HTT requests.
+    Handles both single server and dual server validation scenarios.
     """
     
-    def __init__(self, cg1_client: Optional[Client] = None, cg2_client: Optional[Client] = None):
-        self.cg1_client = cg1_client
-        self.cg2_client = cg2_client
+    def __init__(self, cg1_client: Client, cg2_client: Optional[Client] = None, 
+                 progress_callback: Optional[Callable[[str], None]] = None,
+                 cg1_controller_id: int = 1464099, cg2_controller_id: int = 1464098):
+        """
+        Initialize validator for single or dual server operations.
         
-        # Expected controller IDs
-        self.expected_controller_ids = {
-            'CG1': 1464099,
-            'CG2': 1464098
-        }
-
-    def set_clients(self, cg1_client: Client, cg2_client: Client):
-        """Set the OPC-UA clients for CG1 and CG2"""
+        Args:
+            cg1_client: CG1 OPC-UA client
+            cg2_client: CG2 OPC-UA client (None for single server validation)
+            progress_callback: Progress callback function (same style as HIOCOperator)
+            cg1_controller_id: CG1 controller ID (default: 1464099)
+            cg2_controller_id: CG2 controller ID (default: 1464098)
+        """
         self.cg1_client = cg1_client
         self.cg2_client = cg2_client
-
-    def read_htt_values(self, client: Client) -> Optional[Dict[int, Any]]:
-        """Read HTT threshold values from a server"""
+        self.progress_callback = progress_callback
+        self.cg1_controller_id = cg1_controller_id
+        self.cg2_controller_id = cg2_controller_id
+        
+        # Validation results - public attributes
+        self.htt_match = False              # True if single server or both servers match
+        self.fidsize = 0                   # 0=no match/error, 1=HIOC_TH, >1=HIOC_PS
+        self.th_val_array = {}             # TH1-TH15 values dict {1: val1, 2: val2, ...}
+        
+        # Internal state
+        self._is_dual_mode = cg2_client is not None
+        
+    def _report_progress(self, message: str):
+        """Report progress to callback (same style as HIOCOperator)"""
+        if self.progress_callback:
+            self.progress_callback(message)
+    
+    def validate(self, fid: str) -> bool:
+        """
+        Perform validation for given FID on configured servers.
+        
+        Args:
+            fid: Function ID (F0, F1, F2, F3, F4, F5)
+            
+        Returns:
+            bool: True if validation successful, False otherwise
+            
+        Sets attributes:
+            - htt_match: True if HTT validation passed
+            - fidsize: FIDSize value (0 if error/mismatch)
+            - th_val_array: HTT values dict
+        """
+        try:
+            self._report_progress("Starting HTT validation for {}...".format(fid))
+            
+            if self._is_dual_mode:
+                return self._validate_dual_servers(fid)
+            else:
+                return self._validate_single_server(fid)
+                
+        except Exception as e:
+            self._report_progress("✗ HTT validation failed: {}".format(e))
+            logger.error("HTT validation error for {}: {}".format(fid, e))
+            self._reset_validation_state()
+            return False
+    
+    def _validate_single_server(self, fid: str) -> bool:
+        """Validate single server (CG1)"""
+        self._report_progress("Requesting HTT from CG1...")
+        
+        # Request HTT from CG1 using HIOCOperator
+        cg1_htt_success, cg1_fidsize, cg1_htt_values = self._request_htt_from_server(
+            self.cg1_client, self.cg1_controller_id, fid, "CG1")
+        
+        if not cg1_htt_success:
+            self._report_progress("✗ CG1 HTT request failed")
+            self._reset_validation_state()
+            return False
+        
+        # Single server - always considered a match
+        self.htt_match = True
+        self.fidsize = cg1_fidsize
+        self.th_val_array = cg1_htt_values
+        
+        self._report_progress("✓ CG1 HTT validation successful")
+        self._report_progress("  FIDSize: {}".format(self.fidsize))
+        self._report_progress("  Operation type: {}".format(self._get_operation_type_string()))
+        
+        return True
+    
+    def _validate_dual_servers(self, fid: str) -> bool:
+        """Validate dual servers (CG1 & CG2) with HTT comparison"""
+        # Request HTT from both servers
+        self._report_progress("Requesting HTT from CG1...")
+        cg1_htt_success, cg1_fidsize, cg1_htt_values = self._request_htt_from_server(
+            self.cg1_client, self.cg1_controller_id, fid, "CG1")
+        
+        if not cg1_htt_success:
+            self._report_progress("✗ CG1 HTT request failed")
+            self._reset_validation_state()
+            return False
+        
+        self._report_progress("Requesting HTT from CG2...")
+        cg2_htt_success, cg2_fidsize, cg2_htt_values = self._request_htt_from_server(
+            self.cg2_client, self.cg2_controller_id, fid, "CG2")
+        
+        if not cg2_htt_success:
+            self._report_progress("✗ CG2 HTT request failed")
+            self._reset_validation_state()
+            return False
+        
+        # Compare FIDSize values
+        if cg1_fidsize != cg2_fidsize:
+            self._report_progress("✗ FIDSize mismatch: CG1={}, CG2={}".format(cg1_fidsize, cg2_fidsize))
+            self._reset_validation_state()
+            return False
+        
+        # Compare HTT values
+        htt_mismatches = []
+        for i in range(1, 16):  # TH1-TH15
+            cg1_val = cg1_htt_values.get(i)
+            cg2_val = cg2_htt_values.get(i)
+            
+            if cg1_val != cg2_val:
+                htt_mismatches.append("TH{}: CG1={}, CG2={}".format(i, cg1_val, cg2_val))
+        
+        if htt_mismatches:
+            self._report_progress("✗ HTT value mismatches detected:")
+            for mismatch in htt_mismatches[:3]:  # Show first 3 mismatches
+                self._report_progress("    {}".format(mismatch))
+            if len(htt_mismatches) > 3:
+                self._report_progress("    ... and {} more mismatches".format(len(htt_mismatches) - 3))
+            self._reset_validation_state()
+            return False
+        
+        # All validations passed
+        self.htt_match = True
+        self.fidsize = cg1_fidsize  # Both are same due to validation
+        self.th_val_array = cg1_htt_values  # Both are same due to validation
+        
+        self._report_progress("✓ Dual server HTT validation successful")
+        self._report_progress("  FIDSize: {} (both servers)".format(self.fidsize))
+        self._report_progress("  HTT values: All TH1-TH15 match between CG1 & CG2")
+        self._report_progress("  Operation type: {}".format(self._get_operation_type_string()))
+        
+        return True
+    
+    def _request_htt_from_server(self, client: Client, controller_id: int, fid: str, 
+                                server_name: str) -> Tuple[bool, int, Dict[int, Any]]:
+        """
+        Request HTT from a single server using HIOCOperator.
+        
+        Returns:
+            tuple: (success, fidsize, htt_values_dict)
+        """
+        try:
+            # Create HIOCOperator configuration for HTT request
+            # Use THRESHOLD operation type as placeholder (only HTT request matters)
+            config = HIOCOperationConfig(
+                client=client,
+                controller_id=controller_id,
+                fid=fid,
+                operation_type=HIOCOperationType.THRESHOLD,
+                threshold_command_code=1,  # Dummy value for HTT request
+                threshold_value=0,         # Dummy value for HTT request
+                timeout_seconds=5.0,       # Shorter timeout for validation
+                progress_callback=lambda msg: self._report_progress("{}: {}".format(server_name, msg))
+            )
+            
+            # Create operator and perform HTT request only
+            operator = HIOCOperator(config)
+            htt_success = operator._perform_htt_request()
+            
+            if not htt_success:
+                logger.warning("HTT request failed for {} on {}".format(fid, server_name))
+                return False, 0, {}
+            
+            # Read FIDSize and HTT values from populated HTT registry
+            fidsize = self._read_fidsize(client)
+            htt_values = self._read_htt_values(client)
+            
+            if fidsize is None or not htt_values:
+                logger.warning("Failed to read FIDSize or HTT values from {} after HTT request".format(server_name))
+                return False, 0, {}
+            
+            self._report_progress("{}: HTT populated successfully (FIDSize={})".format(server_name, fidsize))
+            
+            return True, fidsize, htt_values
+            
+        except Exception as e:
+            logger.error("HTT request failed for {} on {}: {}".format(fid, server_name, e))
+            return False, 0, {}
+    
+    def _read_fidsize(self, client: Client) -> Optional[int]:
+        """Read FIDSize from HTT registry"""
+        try:
+            objects = client.get_objects_node()
+            fidsize_node = objects.get_child(["1:HTT", "1:FIDSize"])
+            fidsize = fidsize_node.get_value()
+            return fidsize
+        except Exception as e:
+            logger.error("Failed to read FIDSize: {}".format(e))
+            return None
+    
+    def _read_htt_values(self, client: Client) -> Dict[int, Any]:
+        """Read HTT threshold values (TH1-TH15) from HTT registry"""
         try:
             objects = client.get_objects_node()
             htt_values = {}
             
-            for i in range(1, 16):
+            for i in range(1, 16):  # TH1-TH15
                 try:
-                    htt_node = objects.get_child(["1:HTT", f"1:TH{i}"])
+                    htt_node = objects.get_child(["1:HTT", "1:TH{}".format(i)])
                     value = htt_node.get_value()
                     htt_values[i] = value
                 except Exception as e:
@@ -98,221 +238,118 @@ class HIOCSUPValidator:
             
         except Exception as e:
             logger.error("Failed to read HTT values: {}".format(e))
-            return None
-
-    def read_fidsize(self, client: Client, fid: str) -> Optional[int]:
-        """Read FIDSize for a given FID from common HTT registry (HTT must be populated first)"""
-        try:
-            objects = client.get_objects_node()
-            # HTT is common registry populated after Flag=21→22 sequence
-            fidsize_node = objects.get_child(["1:HTT", "1:FIDSize"])  # Common FIDSize
-            fidsize = fidsize_node.get_value()
-            return fidsize
-            
-        except Exception as e:
-            logger.error("Failed to read FIDSize for {}: {}".format(fid, e))
-            return None
-
-    def compare_htt_tables(self) -> HTTComparisonResult:
-        """Compare HTT threshold tables between CG1 and CG2"""
-        if not self.cg1_client or not self.cg2_client:
-            return HTTComparisonResult(
-                result=ValidationResult.ERROR,
-                error_message="CG1 or CG2 client not available"
-            )
-        
-        try:
-            # Read HTT values from both systems
-            cg1_htt = self.read_htt_values(self.cg1_client)
-            cg2_htt = self.read_htt_values(self.cg2_client)
-            
-            if not cg1_htt or not cg2_htt:
-                return HTTComparisonResult(
-                    result=ValidationResult.MISSING_DATA,
-                    cg1_htt=cg1_htt,
-                    cg2_htt=cg2_htt,
-                    error_message="Failed to read HTT values from one or both systems"
-                )
-            
-            # Compare threshold values
-            mismatches = []
-            for i in range(1, 16):
-                cg1_val = cg1_htt.get(i)
-                cg2_val = cg2_htt.get(i)
-                
-                if cg1_val != cg2_val:
-                    mismatches.append("TH{}: CG1={}, CG2={}".format(i, cg1_val, cg2_val))
-            
-            if mismatches:
-                logger.warning("HTT mismatches found: {}".format('; '.join(mismatches)))
-                return HTTComparisonResult(
-                    result=ValidationResult.MISMATCH,
-                    mismatches=mismatches,
-                    cg1_htt=cg1_htt,
-                    cg2_htt=cg2_htt
-                )
-            
-            logger.info("HTT values match between CG1 and CG2")
-            return HTTComparisonResult(
-                result=ValidationResult.SUCCESS,
-                cg1_htt=cg1_htt,
-                cg2_htt=cg2_htt
-            )
-            
-        except Exception as e:
-            return HTTComparisonResult(
-                result=ValidationResult.ERROR,
-                error_message="Error during HTT comparison: {}".format(e)
-            )
-
-    def compare_fidsize_capability(self, fid: str) -> FIDSizeComparisonResult:
-        """Compare FIDSize for HIOCwSUP capability between CG1 and CG2"""
-        if not self.cg1_client or not self.cg2_client:
-            return FIDSizeComparisonResult(
-                result=ValidationResult.ERROR,
-                fid=fid,
-                error_message="CG1 or CG2 client not available"
-            )
-        
-        try:
-            # Read FIDSize from both systems
-            cg1_fidsize = self.read_fidsize(self.cg1_client, fid)
-            cg2_fidsize = self.read_fidsize(self.cg2_client, fid)
-            
-            if cg1_fidsize is None or cg2_fidsize is None:
-                return FIDSizeComparisonResult(
-                    result=ValidationResult.MISSING_DATA,
-                    fid=fid,
-                    cg1_fidsize=cg1_fidsize,
-                    cg2_fidsize=cg2_fidsize,
-                    error_message="Failed to read FIDSize{} from one or both systems".format(fid)
-                )
-            
-            # Check if both support SUP (FIDSize > 1)
-            cg1_supports_sup = cg1_fidsize > 1
-            cg2_supports_sup = cg2_fidsize > 1
-            both_support_sup = cg1_supports_sup and cg2_supports_sup
-            
-            if cg1_fidsize != cg2_fidsize:
-                return FIDSizeComparisonResult(
-                    result=ValidationResult.MISMATCH,
-                    fid=fid,
-                    cg1_fidsize=cg1_fidsize,
-                    cg2_fidsize=cg2_fidsize,
-                    both_support_sup=both_support_sup
-                )
-            
-            logger.info("FIDSize{} matches between CG1 and CG2: {}".format(fid, cg1_fidsize))
-            return FIDSizeComparisonResult(
-                result=ValidationResult.SUCCESS,
-                fid=fid,
-                cg1_fidsize=cg1_fidsize,
-                cg2_fidsize=cg2_fidsize,
-                both_support_sup=both_support_sup
-            )
-            
-        except Exception as e:
-            return FIDSizeComparisonResult(
-                result=ValidationResult.ERROR,
-                fid=fid,
-                error_message="Error during FIDSize comparison: {}".format(e)
-            )
-
-    def validate_controller_ids(self) -> ControllerIDValidationResult:
-        """Validate that we're connected to the correct controller IDs"""
-        # Note: This would require reading the actual controller ID from the servers
-        # The implementation depends on how controller IDs are exposed in OPC-UA
-        # For now, this is a placeholder that could be implemented if the controller
-        # ID is available as a readable node
-        
-        try:
-            # This is a placeholder - actual implementation would read controller IDs
-            # from OPC-UA nodes if they're exposed
-            
-            return ControllerIDValidationResult(
-                result=ValidationResult.SUCCESS,
-                cg1_actual=self.expected_controller_ids['CG1'],  # Placeholder
-                cg2_actual=self.expected_controller_ids['CG2']   # Placeholder
-            )
-            
-        except Exception as e:
-            return ControllerIDValidationResult(
-                result=ValidationResult.ERROR,
-                error_message="Error during controller ID validation: {}".format(e)
-            )
-
-    def validate_for_dual_hioc_operation(self, fid: str = None) -> Dict[str, Any]:
-        """Comprehensive validation for dual HIOC operations"""
-        validation_results = {}
-        
-        # Always check HTT comparison for HIOC operations
-        validation_results['htt_comparison'] = self.compare_htt_tables()
-        
-        # If FID specified, check FIDSize compatibility for potential SUP operations
-        if fid:
-            validation_results['fidsize_comparison'] = self.compare_fidsize_capability(fid)
-        
-        # Determine overall validation result
-        all_successful = all(
-            result.result == ValidationResult.SUCCESS 
-            for result in validation_results.values()
-        )
-        
-        validation_results['overall_success'] = all_successful
-        
-        return validation_results
-
-    def get_htt_mismatch_summary(self, htt_result: HTTComparisonResult) -> str:
-        """Get formatted summary of HTT mismatches for display"""
-        if htt_result.result != ValidationResult.MISMATCH or not htt_result.mismatches:
-            return "No HTT mismatches found"
-        
-        summary = "HTT threshold values don't match between CG1 and CG2:\n\n"
-        summary += "\n".join(htt_result.mismatches)
-        summary += "\n\nDual operations cannot proceed with mismatched thresholds."
-        
-        return summary
-
-    def get_validation_summary(self, validation_results: Dict[str, Any]) -> str:
-        """Get formatted summary of all validation results"""
-        summary_lines = ["Dual Operation Validation Summary:", "=" * 40]
-        
-        for check_name, result in validation_results.items():
-            if check_name == 'overall_success':
-                continue
-                
-            if hasattr(result, 'result'):
-                status = "✓" if result.result == ValidationResult.SUCCESS else "✗"
-                summary_lines.append(f"{status} {check_name.replace('_', ' ').title()}: {result.result.value}")
-                
-                if result.result != ValidationResult.SUCCESS and hasattr(result, 'error_message') and result.error_message:
-                    summary_lines.append(f"  Error: {result.error_message}")
-        
-        overall_status = "✓ PASSED" if validation_results.get('overall_success') else "✗ FAILED"
-        summary_lines.append(f"\nOverall Result: {overall_status}")
-        
-        return "\n".join(summary_lines)
-
-
-def create_example_validator(cg1_client: Client, cg2_client: Client):
-    """Example of how to create and use HIOCSUPValidator"""
+            return {}
     
-    validator = HIOCSUPValidator(cg1_client, cg2_client)
+    def _reset_validation_state(self):
+        """Reset validation state to failure/error state"""
+        self.htt_match = False
+        self.fidsize = 0
+        self.th_val_array = {}
     
-    # Check HTT compatibility before dual threshold operation
-    htt_result = validator.compare_htt_tables()
-    if htt_result.result != ValidationResult.SUCCESS:
-        print("HTT validation failed:")
-        print(validator.get_htt_mismatch_summary(htt_result))
-        return False
+    def _get_operation_type_string(self) -> str:
+        """Get human-readable operation type string"""
+        if self.is_hioc_bo():
+            return "HIOC_BO (Boolean operations)"
+        elif self.is_hioc_th():
+            return "HIOC_TH (Threshold operations)"
+        elif self.is_hioc_ps():
+            return "HIOC_PS (Parameter Set operations - HIOCwSUP)"
+        else:
+            return "Unknown/Error"
     
-    # Check if both systems support SUP for a specific FID
-    fidsize_result = validator.compare_fidsize_capability('F3')
-    if fidsize_result.both_support_sup:
-        print(f"Both systems support HIOCwSUP for {fidsize_result.fid}")
+    # Helper methods for operation type detection
+    def is_hioc_bo(self) -> bool:
+        """Returns True if fidsize=0 (HIOC_BO - Boolean operations)"""
+        return self.fidsize == 0
     
-    # Comprehensive validation for dual operation
-    validation_results = validator.validate_for_dual_hioc_operation('F3')
-    print(validator.get_validation_summary(validation_results))
+    def is_hioc_th(self) -> bool:
+        """Returns True if fidsize=1 (HIOC_TH - Threshold operations)"""
+        return self.fidsize == 1
     
-    return validation_results['overall_success']
+    def is_hioc_ps(self) -> bool:
+        """Returns True if fidsize>1 (HIOC_PS - Parameter Set operations)"""
+        return self.fidsize > 1
+    
+    # Convenience methods for validation results
+    def get_validation_summary(self) -> str:
+        """Get human-readable validation summary"""
+        if not self.htt_match:
+            return "HTT validation failed - servers incompatible for dual operations"
+        
+        lines = []
+        lines.append("HTT validation successful:")
+        lines.append("  Servers: {}".format("CG1 & CG2" if self._is_dual_mode else "CG1"))
+        lines.append("  FIDSize: {}".format(self.fidsize))
+        lines.append("  Operation type: {}".format(self._get_operation_type_string()))
+        
+        if self.is_hioc_th():
+            valid_thresholds = sum(1 for v in self.th_val_array.values() if v is not None)
+            lines.append("  Valid thresholds: {}/15".format(valid_thresholds))
+        
+        return "\n".join(lines)
+    
+    def is_validation_successful(self) -> bool:
+        """Check if validation was successful"""
+        return self.htt_match and self.fidsize >= 0  # Allow fidsize=0 for HIOC_BO
+    
+    def supports_hiocwsup(self) -> bool:
+        """Check if HIOCwSUP (parameter set) operations are supported"""
+        return self.is_hioc_ps()
+
+
+# Example usage for integration with hioc_module.py
+def example_usage():
+    """Example showing how hioc_module.py should use the updated validator"""
+    
+    # Mock clients
+    from opcua import Client
+    cg1_client = Client("opc.tcp://cg1:4840")
+    cg2_client = Client("opc.tcp://cg2:4840")
+    
+    def progress_callback(message: str):
+        print("Validation: {}".format(message))
+    
+    # Single server validation
+    validator_single = HIOCSUPValidator(cg1_client, progress_callback=progress_callback)
+    if validator_single.validate("F3"):
+        print("Single server validation successful")
+        print("FIDSize: {}".format(validator_single.fidsize))
+        print("Supports HIOCwSUP: {}".format(validator_single.supports_hiocwsup()))
+        
+        # Use th_val_array directly in threshold selection listbox
+        for i, value in validator_single.th_val_array.items():
+            if value is not None:
+                print("TH{}: {}".format(i, value))
+    
+    # Dual server validation
+    validator_dual = HIOCSUPValidator(cg1_client, cg2_client, progress_callback=progress_callback)
+    if validator_dual.validate("F3"):
+        print("Dual server validation successful")
+        print(validator_dual.get_validation_summary())
+        
+        # Can proceed with dual HIOCwSUP operation
+        if validator_dual.supports_hiocwsup():
+            print("Ready for dual HIOCwSUP operation")
+
+
+# Integration notes for hioc_module.py:
+#
+# 1. Replace custom HTT request code with HIOCSUPValidator calls:
+#    validator = HIOCSUPValidator(cg1_client, cg2_client, self.update_progress)
+#    if validator.validate(fid):
+#        # Use validator.fidsize, validator.th_val_array, validator.supports_hiocwsup()
+#
+# 2. Use in on_fid_change():
+#    def check_fid_capabilities(self):
+#        validator = HIOCSUPValidator(...)
+#        if validator.validate(fid) and validator.supports_hiocwsup():
+#            self.enable_parameter_set()
+#        else:
+#            self.disable_parameter_set("Reason from validator")
+#
+# 3. Use in start_operation():
+#    validator = HIOCSUPValidator(...)
+#    if not validator.validate(fid):
+#        self.update_progress("Validation failed")
+#        return
+#    # Proceed with operation using validator.th_val_array for threshold selection
